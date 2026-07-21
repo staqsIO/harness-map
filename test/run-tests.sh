@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test suite for harness-map. Runs the scanner and renderer against fixtures and
+# Test suite for claude-harness-visualizer. Runs the scanner and renderer against fixtures and
 # asserts the contracts that matter: valid output, graceful degradation on a
 # minimal config, and no secret leakage.
 set -uo pipefail
@@ -23,7 +23,7 @@ d=json.load(open('$1'))
 print('true' if bool($2) else 'false')
 " 2>/dev/null || echo false; }
 
-echo "harness-map tests"
+echo "claude-harness-visualizer tests"
 
 # --- 1. minimal config: degrades, never crashes ------------------------------
 echo "[minimal fixture]"

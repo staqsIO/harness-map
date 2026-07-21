@@ -1,7 +1,7 @@
-<h1 align="center">harness-map</h1>
+<h1 align="center">Claude Harness Visualizer</h1>
 
 <p align="center">
-  <a href="https://github.com/staqsIO/harness-map/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/staqsIO/harness-map/ci.yml?style=flat-square&label=ci" alt="CI"></a>
+  <a href="https://github.com/staqsIO/claude-harness-visualizer/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/staqsIO/claude-harness-visualizer/ci.yml?style=flat-square&label=ci" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/claude%20code-plugin-D97757?style=flat-square" alt="Claude Code plugin">
@@ -17,13 +17,13 @@ Claude Code configuration accretes. Agents in one directory, hooks in
 `settings.json`, routing conventions in prose, plugins from four marketplaces,
 MCP servers declared in four different places. Nothing shows you what you have.
 
-`harness-map` reads all of it, draws it, and **checks it** — which is how the
+`claude-harness-visualizer` reads all of it, draws it, and **checks it** — which is how the
 author found five hooks in their own config that had never worked.
 
 ```bash
-/plugin marketplace add staqsIO/harness-map
-/plugin install harness-map
-/harness-map
+/plugin marketplace add staqsIO/claude-harness-visualizer
+/plugin install claude-harness-visualizer
+/claude-harness-visualizer
 ```
 
 ## What it shows

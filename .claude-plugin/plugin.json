@@ -1,13 +1,13 @@
 {
-  "name": "harness-map",
+  "name": "claude-harness-visualizer",
   "version": "0.1.0",
   "description": "Visualize your Claude Code harness — agents by model tier, hooks across the session lifecycle, orchestrator routing, and the review pipeline — as an interactive page",
   "author": {
     "name": "staqs",
     "email": "eric@staqs.io"
   },
-  "repository": "https://github.com/staqsIO/harness-map",
-  "homepage": "https://github.com/staqsIO/harness-map",
+  "repository": "https://github.com/staqsIO/claude-harness-visualizer",
+  "homepage": "https://github.com/staqsIO/claude-harness-visualizer",
   "license": "MIT",
   "keywords": [
     "claude-code",

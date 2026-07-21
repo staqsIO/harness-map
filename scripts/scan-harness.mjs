@@ -1184,7 +1184,7 @@ function main() {
 
   const doc = {
     schemaVersion: SCHEMA_VERSION,
-    tool: 'harness-map',
+    tool: 'claude-harness-visualizer',
     redacted: REDACT,
     prose: Boolean(opts.includeProse),
     sources: roots.map((r) => ({ scope: r.label, path: pathOf(r.dir), exists: isDir(r.dir) })),

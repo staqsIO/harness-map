@@ -1,6 +1,6 @@
 ---
-name: harness-map
-description: Visualize a Claude Code harness setup — agents and their model tiers, hooks across the session lifecycle, orchestrator routing, the review pipeline, and installed commands/skills/plugins/MCP servers — as an interactive page. Use when the user says "/harness-map", "visualize my harness", "show my Claude Code setup", "map my agents and hooks", "what hooks do I have", "diagram my config", or asks how their harness is wired. Also use when auditing a config for model-tier drift (bare `inherit`, unpinned agents) or reviewing which hooks fire when.
+name: claude-harness-visualizer
+description: Visualize a Claude Code harness setup — agents and their model tiers, hooks across the session lifecycle, orchestrator routing, the review pipeline, and installed commands/skills/plugins/MCP servers — as an interactive page. Use when the user says "/claude-harness-visualizer", "visualize my harness", "show my Claude Code setup", "map my agents and hooks", "what hooks do I have", "diagram my config", or asks how their harness is wired. Also use when auditing a config for model-tier drift (bare `inherit`, unpinned agents) or reviewing which hooks fire when.
 user_invocable: true
 argument-hint: "[--project <path>] [--include-prose]"
 license: MIT
@@ -98,10 +98,10 @@ the JSON. It exits non-zero when a high-severity check fails.
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/render-map.mjs" \
   --scan /tmp/hm-scan.json --prose /tmp/hm-prose.json \
-  --audit /tmp/hm-audit.json --out /tmp/harness-map.html
+  --audit /tmp/hm-audit.json --out /tmp/claude-harness-visualizer.html
 ```
 
-Publish `/tmp/harness-map.html` with the Artifact tool. Use favicon `🗺️` and keep
+Publish `/tmp/claude-harness-visualizer.html` with the Artifact tool. Use favicon `🗺️` and keep
 it stable across redeploys. Omit `--prose` or `--audit` when you do not have them.
 
 ## Reporting back

@@ -3,7 +3,7 @@ description: Visualize this Claude Code harness — agents, model tiers, hooks, 
 argument-hint: "[--project <path>] [--include-values]"
 ---
 
-Use the `harness-map` skill to scan and visualize the current Claude Code harness.
+Use the `claude-harness-visualizer` skill to scan and visualize the current Claude Code harness.
 
 Arguments (pass through to the scanner): $ARGUMENTS
 

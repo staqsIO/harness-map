@@ -104,7 +104,7 @@ const ERRNOS = [
   'EBUSY', 'ENOSPC', 'EIO', 'ETIMEDOUT', 'unknown error',
 ];
 const KNOWN_NOTES = new Set([
-  'harness-map',
+  'claude-harness-visualizer',
   'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned'
   + ' server-side and cannot be detected from configuration files.',
   // unconfigured reasons

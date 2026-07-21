@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "harness-map",
+  "name": "claude-harness-visualizer",
   "owner": {
     "name": "staqs",
     "email": "eric@staqs.io"
@@ -11,15 +11,15 @@
   },
   "plugins": [
     {
-      "name": "harness-map",
+      "name": "claude-harness-visualizer",
       "source": "./",
-      "description": "Visualize your Claude Code harness — agents by model tier, hooks across the session lifecycle, orchestrator routing, and the review pipeline — as an interactive page. Run `/harness-map` after install.",
+      "description": "Visualize your Claude Code harness — agents by model tier, hooks across the session lifecycle, orchestrator routing, and the review pipeline — as an interactive page. Run `/claude-harness-visualizer` after install.",
       "version": "0.1.0",
       "author": {
         "name": "staqs",
         "email": "eric@staqs.io"
       },
-      "homepage": "https://github.com/staqsIO/harness-map",
+      "homepage": "https://github.com/staqsIO/claude-harness-visualizer",
       "category": "productivity",
       "keywords": [
         "claude-code",
