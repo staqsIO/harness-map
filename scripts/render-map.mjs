@@ -82,7 +82,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, num(v, lo)));
 // been hand-edited or substituted, so shape is never assumed. `arr` normalises;
 // `has` gates a whole view. A view that reads `.items` must see a real array —
 // accepting `undefined` here let a later `.some()` throw and produce no page.
-const arr = (v) => (Array.isArray(v) ? v : []);
+const arr = (v) => (Array.isArray(v) ? v.filter((x) => x !== null && x !== undefined) : []);
 const has = (layer) => layer?.status === 'ok' && Array.isArray(layer?.items);
 const statusOf = (layer) => layer?.status ?? 'unconfigured';
 
@@ -233,7 +233,7 @@ function viewHooks() {
   }
 
   const byEvent = {};
-  for (const h of hooks.items) (byEvent[h.event] ||= []).push(h);
+  for (const h of arr(hooks.items)) (byEvent[h?.event] ||= []).push(h ?? {});
 
   const known = new Set(LIFECYCLE.map(([e]) => e));
   const ordered = [
@@ -272,9 +272,9 @@ function viewHooks() {
 // ---------------------------------------------------------------------------
 
 function detectedList(layer) {
-  if (!layer?.items?.length) return '';
+  if (!arr(layer?.items).length) return '';
   const groups = {};
-  for (const i of layer.items) (groups[i.kind] ||= []).push(i.name);
+  for (const i of arr(layer.items)) (groups[i?.kind] ||= []).push(i?.name);
   return `<div class="pills">${Object.entries(groups).flatMap(([kind, names]) =>
     arr(names).map((n) => `<span class="pill"><span class="pill-kind">${esc(kind)}</span><span class="mono">${esc(n)}</span></span>`)
   ).join('')}</div>`;

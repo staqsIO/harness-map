@@ -201,11 +201,13 @@ const KNOWN_HOOK_TYPES = new Set(['command', 'prompt']);
 // Anthropic-published values, not text the user invented. Anything else is
 // authored and collapses. `model` also accepts a published model id.
 const KNOWN_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable', 'inherit', 'opusplan', 'default']);
-const KNOWN_TRANSPORTS = new Set(['stdio', 'sse', 'http', 'https', 'ws', 'wss', 'sse-http']);
+const KNOWN_TRANSPORTS = new Set(['stdio', 'sse', 'http', 'https', 'ws', 'wss', 'sse-http', 'streamable-http']);
 const KNOWN_STATUSLINE_TYPES = new Set(['command', 'static']);
 const KNOWN_PERMISSION_MODES = new Set([
   'default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto',
 ]);
+const KNOWN_PLUGIN_SCOPES = new Set(['user', 'project', 'local', 'builtin', 'dynamic']);
+const KNOWN_MARKETPLACE_TYPES = new Set(['git', 'github', 'local', 'directory', 'npm', 'url']);
 function modelLabel(raw) {
   if (raw == null) return null;
   const v = String(raw);
@@ -403,6 +405,15 @@ function parseFrontmatter(text) {
     }
     if (value.startsWith('[') || value.startsWith('{')) return reject(`flow collection unsupported ('${key}')`);
 
+    // `model: "sonnet" # note` is valid YAML; the comment is not part of the value.
+    if (value.startsWith('"') || value.startsWith("'")) {
+      const q = value[0];
+      const close = value.indexOf(q, 1);
+      if (close > 0) {
+        const after = value.slice(close + 1);
+        if (after.trim() === '' || /^\s+#/.test(after)) value = value.slice(0, close + 1);
+      }
+    }
     if (value.startsWith('"')) {
       if (!value.endsWith('"') || value.length < 2) return reject(`unterminated double quote ('${key}')`);
       if (value.slice(1, -1).includes('\\')) return reject(`escape sequences unsupported ('${key}')`);
@@ -555,7 +566,10 @@ function scanHooks(settingsFiles) {
         for (const m of cmdText.match(/(?:^|[\s'"=(])((?:\.{1,2}\/|~\/|\$[A-Za-z_][\w]*\/)[\w.\-/$]*\.(?:mjs|js|sh|py|ts))\b/g) ?? []) {
           if (m) unresolvedRefs++;
         }
-        for (const p of cmdText.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
+        // `./guard.sh` and `$CLAUDE_PROJECT_DIR/x.sh` contain a substring that
+        // LOOKS absolute (/guard.sh). Matching it fabricated an absolute path and
+        // then reported it as a missing script. Require a real left boundary.
+        for (const p of cmdText.match(/(?<![\w.$~])\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
           if (seenPath.has(p)) continue;
           seenPath.add(p);
           scriptIndex.set(p, scriptRefs.length);
@@ -654,8 +668,16 @@ function scanSkills(roots) {
     const skillsDir = join(dir, 'skills');
     if (!isDir(skillsDir)) continue;
     for (const entry of listDir(skillsDir)) {
-      const skillFile = join(skillsDir, entry, 'SKILL.md');
+      const skillDir = join(skillsDir, entry);
+      // A symlinked skill directory can point anywhere; its SKILL.md frontmatter
+      // (and any parse warning naming its keys) would then be external content
+      // in a published page. Same containment rule the rules scanner uses.
+      let st;
+      try { st = lstatSync(skillDir); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      const skillFile = join(skillDir, 'SKILL.md');
       if (!existsSync(skillFile)) continue;
+      try { if (!lstatSync(skillFile).isFile()) continue; } catch { continue; }
       const { fm: parsed, warning, nonScalar } = frontmatterOf(skillFile);
       if (warning) parseWarnings.push({ file: pathOf(skillFile), warnings: [warning] });
       const badKeys = ['name', 'description'].filter((k) => nonScalar?.has(k));
@@ -695,7 +717,8 @@ function scanPlugins(userDir, settingsFiles) {
       items.push({
         name: ident(name),
         marketplace: ident(marketplace, 60) ?? null,
-        scope: ident(first?.scope, 20) ?? null,
+        scope: first?.scope == null ? null
+          : (REDACT ? enumOr(first.scope, KNOWN_PLUGIN_SCOPES, CUSTOM) : ident(first.scope, 20)),
         version: ident(first?.version, 40) ?? null,
         enabled: key in enabledMap ? Boolean(enabledMap[key]) : null,
       });
@@ -708,7 +731,8 @@ function scanPlugins(userDir, settingsFiles) {
       const src = meta?.source ?? {};
       marketplaces.push({
         name: ident(name),
-        type: ident(src.source, 20) ?? null,
+        type: src.source == null ? null
+          : (REDACT ? enumOr(src.source, KNOWN_MARKETPLACE_TYPES, CUSTOM) : ident(src.source, 20)),
         // A marketplace repo slug is a public identifier; a local path is not.
         repo: src.repo ? ident(src.repo, 80) : src.path ? pathOf(src.path) : null,
       });
@@ -1057,7 +1081,21 @@ function applyProsePolicy(doc, includeProse) {
         : it.kind === 'skill' ? skillNames.get(it.name)
           : commandNames.get(it.name)) ?? '<detected>',
     }));
-    layer.proseRefs = (layer.proseRefs ?? []).map((r) => ({ name: r.name, file: '<file>', headings: [] }));
+    // A rule FILENAME is authored (CLIENT-routing-SECRET.md), so the default
+    // refers to prose sources by index.
+    layer.proseRefs = (layer.proseRefs ?? []).map((r, i) => ({
+      name: `rule-${pad(i)}`, file: '<file>', headings: [],
+    }));
+  }
+  // A parse-warning message quotes the offending KEY, which is authored text:
+  // `anchor/alias/tag unsupported ('CLIENT_SECRET')`. Keep the reason, drop the key.
+  const stripKey = (w) => String(w).replace(/\s*\('[^']*'\)/g, '').replace(/ for [\w, -]+$/, '');
+  for (const lyr of [L.agents, L.skills]) {
+    if (lyr?.parseWarnings) {
+      lyr.parseWarnings = lyr.parseWarnings.map((w) => ({
+        file: '<file>', warnings: (w.warnings ?? []).map(stripKey),
+      }));
+    }
   }
   // Hook matchers are user-written; keep only simple tool-name forms.
   if (L.hooks?.status === 'ok') {

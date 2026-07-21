@@ -74,8 +74,23 @@ node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" --include-values > "$TMP/
 check "$(grep -qE 'hunter2|supersecret' "$TMP/raw.json" && echo true || echo false)" "--include-values opts out of redaction"
 
 # --- 2d. MCP precedence -------------------------------------------------------
+# Local-scope servers live under `projects[<absolute project path>]` in
+# .claude.json, so this fixture is inherently path-dependent. Committing one
+# machine's checkout path made the suite pass here and fail on any other clone
+# (and in CI). Build it against the real path at run time instead.
 echo "[mcp precedence]"
-node "$SCAN" --root "$ROOT/test/fixtures/prec/.claude" --project "$ROOT/test/fixtures/prec/proj" --include-prose > "$TMP/prec.json"
+cp -R "$ROOT/test/fixtures/prec" "$TMP/prec-fx"
+python3 - "$TMP/prec-fx" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+proj = os.path.join(root, 'proj')
+p = os.path.join(root, '.claude.json')
+json.dump({
+    "mcpServers": {"db": {"command": "user-server"}},
+    "projects": {proj: {"mcpServers": {"db": {"command": "local-server"}}}},
+}, open(p, 'w'))
+PYEOF
+node "$SCAN" --root "$TMP/prec-fx/.claude" --project "$TMP/prec-fx/proj" --include-prose > "$TMP/prec.json"
 check "$(j "$TMP/prec.json" "any(m['name']=='db' and m['origin']=='local' for m in d['layers']['mcp']['items'])")" \
       "local scope wins over project and user"
 check "$(j "$TMP/prec.json" "len([m for m in d['layers']['mcp']['items'] if m['name']=='db'])==1")" \
@@ -303,6 +318,54 @@ PYEOF
 node "$RENDER" --scan "$TMP/r5.json" --audit "$TMP/hostile4.json" --out "$TMP/hostile4.html" 2>/dev/null
 check "$([ -s "$TMP/hostile4.html" ] && echo true || echo false)" \
       "renderer survives a finding whose evidence is a string"
+
+# --- round 6: fields and paths that still carried authored text ---------------
+mkdir -p "$TMP/r6/.claude/skills" "$TMP/r6/.claude/agents" "$TMP/r6/.claude/plugins" "$TMP/r6/outside/evil"
+cat > "$TMP/r6/.claude/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./guard.sh"}]}]}}
+JSON
+cat > "$TMP/r6/.claude/plugins/installed_plugins.json" <<'JSON'
+{"p@m":[{"scope":"/private/CLIENT_SCOPE_SECRET","version":"1.0"}]}
+JSON
+cat > "$TMP/r6/.claude/plugins/known_marketplaces.json" <<'JSON'
+{"m":{"source":{"source":"CLIENT_MKT_SECRET","repo":"a/b"}}}
+JSON
+printf -- '---\nCLIENT_KEY_SECRET: &x v\nname: a\n---\nx\n' > "$TMP/r6/.claude/agents/a.md"
+printf -- '---\nname: CLIENT_SKILL_SECRET\n---\n' > "$TMP/r6/outside/evil/SKILL.md"
+ln -s "$TMP/r6/outside/evil" "$TMP/r6/.claude/skills/linked"
+node "$SCAN" --root "$TMP/r6/.claude" > "$TMP/r6.json" 2>/dev/null
+
+check "$(! grep -qE 'CLIENT_[A-Z_]+' "$TMP/r6.json" && echo true || echo false)" \
+      "plugin scope, marketplace type, a parse-warning key and a symlinked skill all stay out of default output"
+check "$(j "$TMP/r6.json" "d['layers']['hooks']['scriptRefs']==[] and d['layers']['hooks']['unresolvedRefs']==1")" \
+      "./guard.sh counts as unresolved and is never treated as the absolute path /guard.sh"
+check "$(j "$TMP/r6.json" "all('CLIENT' not in w for x in d['layers']['agents'].get('parseWarnings',[]) for w in x['warnings'])")" \
+      "a parse warning states the reason without quoting the authored key"
+check "$(j "$TMP/r6.json" "d['layers']['skills']['status']=='unconfigured'")" \
+      "a symlinked skill directory is not followed out of the config tree"
+
+printf -- '---\nname: q\nmodel: "sonnet" # trailing note\n---\nx\n' > "$TMP/r6/.claude/agents/a.md"
+node "$SCAN" --root "$TMP/r6/.claude" --include-prose > "$TMP/r6q.json" 2>/dev/null
+check "$(j "$TMP/r6q.json" "any(a['model']=='sonnet' for a in d['layers']['agents']['items'])")" \
+      "a quoted scalar with a trailing comment parses to the quoted value"
+
+python3 - "$TMP/nulls.json" <<'PYEOF'
+import json,sys
+json.dump({"schemaVersion":2,"layers":{
+  "hooks":{"status":"ok","count":1,"items":[None],"byEvent":{},"events":[]}}}, open(sys.argv[1],"w"))
+PYEOF
+node "$RENDER" --scan "$TMP/nulls.json" --out "$TMP/nulls.html" 2>/dev/null
+check "$([ -s "$TMP/nulls.html" ] && echo true || echo false)" \
+      "renderer survives a null element inside an otherwise valid array"
+
+python3 - "$TMP/hidden.json" <<'PYEOF'
+import json,sys
+json.dump({"schemaVersion":2,"layers":{"environment":{"status":"ok",
+  "env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"<hidden>"},
+  "permissions":{"allow":1,"deny":0,"ask":0,"toolBreakdown":{}}}}}, open(sys.argv[1],"w"))
+PYEOF
+check "$(node "$AUDIT" --scan "$TMP/hidden.json" 2>/dev/null | grep -qi 'NaN' && echo false || echo true)" \
+      "a withheld auto-compact value never renders as NaNk"
 
 head -c 20000000 /dev/zero | tr '\0' 'x' > "$TMP/huge.json" 2>/dev/null
 node "$AUDIT" --scan "$TMP/huge.json" >/dev/null 2>"$TMP/huge.err"

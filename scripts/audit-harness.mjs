@@ -158,8 +158,8 @@ const CHECKS = [
     run: () => {
       const s = L.environment.statusLine.script;
       return s.exists
-        ? { status: PASS, detail: s.path }
-        : { status: FAIL, detail: 'referenced script not found', evidence: [s.path] };
+        ? { status: PASS, detail: `status line script ${s.name} exists` }
+        : { status: FAIL, detail: 'referenced status line script not found', evidence: [s.name] };
     },
   },
   {
@@ -227,9 +227,13 @@ const CHECKS = [
     applies: () => L.environment?.status === 'ok',
     run: () => {
       const v = L.environment.env?.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
-      return v
-        ? { status: PASS, detail: `set to ${v} (fires near ${Math.round(Number(v) * 0.84 / 1000)}k)` }
-        : { status: FAIL, detail: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW not set' };
+      if (v == null) return { status: FAIL, detail: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW not set' };
+      // The value is withheld unless it is in the documented numeric domain, so a
+      // withheld value means "set, but not a number we can do arithmetic on".
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0
+        ? { status: PASS, detail: `set to ${v} (fires near ${Math.round((n * 0.84) / 1000)}k)` }
+        : { status: PASS, detail: 'set (value withheld, so the trigger point is not computed)' };
     },
   },
 
