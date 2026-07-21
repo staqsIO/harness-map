@@ -22,7 +22,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, basename, extname, relative, sep } from 'node:path';
+import { join, basename, dirname, extname, relative, sep } from 'node:path';
 
 const SCHEMA_VERSION = 1;
 const HOME = homedir();
@@ -287,10 +287,18 @@ function scanSkills(roots) {
   return items.length ? ok(items.sort((a, b) => a.name.localeCompare(b.name))) : unconfigured('no skills/*/SKILL.md found');
 }
 
-function scanPlugins(userDir) {
+function scanPlugins(userDir, settingsFiles) {
   const installed = readJson(join(userDir, 'plugins', 'installed_plugins.json'));
   const known = readJson(join(userDir, 'plugins', 'known_marketplaces.json'));
   const items = [];
+
+  // enabledPlugins maps "name@marketplace" -> boolean. A plugin can be installed
+  // but switched off, in which case its commands/skills/MCP servers are inert.
+  const enabledMap = {};
+  for (const { data } of settingsFiles) {
+    const ep = data?.enabledPlugins;
+    if (ep && typeof ep === 'object' && !Array.isArray(ep)) Object.assign(enabledMap, ep);
+  }
 
   const plugins = installed?.plugins;
   if (plugins && typeof plugins === 'object') {
@@ -302,6 +310,7 @@ function scanPlugins(userDir) {
         marketplace: marketplace ?? null,
         scope: first?.scope ?? null,
         version: first?.version ?? null,
+        enabled: key in enabledMap ? Boolean(enabledMap[key]) : null,
       });
     }
   }
@@ -319,12 +328,27 @@ function scanPlugins(userDir) {
   }
 
   if (!items.length && !marketplaces.length) return unconfigured('no installed plugins or marketplaces found');
-  return ok(items.sort((a, b) => a.name.localeCompare(b.name)), { marketplaces });
+  const disabled = items.filter((p) => p.enabled === false).map((p) => p.name);
+  return ok(items.sort((a, b) => a.name.localeCompare(b.name)), { marketplaces, disabled });
 }
 
-function scanMcp(settingsFiles, roots) {
+/**
+ * MCP servers are declared in four different places. Reading only settings.json
+ * (the obvious one) undercounts badly — most servers live in ~/.claude.json or
+ * are bundled with a plugin.
+ *
+ *   1. settings.json / settings.local.json  -> mcpServers
+ *   2. ~/.claude.json                       -> mcpServers          (global)
+ *   3. ~/.claude.json                       -> projects[path].mcpServers
+ *   4. a plugin's own .mcp.json             (inert if plugin disabled)
+ *   5. <root>/.mcp.json, <project>/.mcp.json
+ *
+ * Account-level connectors (Gmail, Drive, Figma, …) are provisioned server-side
+ * and are NOT discoverable from disk; they are reported as a caveat, not a count.
+ */
+function scanMcp(settingsFiles, roots, userDir, projectPath) {
   const items = [];
-  const push = (name, cfg, scope, source) => {
+  const push = (name, cfg, origin, source, extra = {}) => {
     items.push({
       name,
       transport: cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null),
@@ -335,26 +359,88 @@ function scanMcp(settingsFiles, roots) {
         ? Object.keys(cfg.env).map((k) => (REDACT ? k : `${k}=${cfg.env[k]}`))
         : [],
       url: cfg?.url ? (REDACT ? scrub(String(cfg.url)).replace(/\?.*$/, '?<redacted>') : String(cfg.url)) : null,
-      scope,
+      origin,
       source,
+      ...extra,
     });
   };
 
+  const eachServer = (obj, fn) => {
+    if (obj && typeof obj === 'object') for (const [n, c] of Object.entries(obj)) fn(n, c);
+  };
+
+  // (1) settings files
   for (const { scope, file, data } of settingsFiles) {
-    const servers = data?.mcpServers;
-    if (servers && typeof servers === 'object') {
-      for (const [name, cfg] of Object.entries(servers)) push(name, cfg, scope, file);
+    eachServer(data?.mcpServers, (n, c) => push(n, c, `settings (${scope})`, file));
+  }
+
+  // (2)+(3) claude.json — global and per-project.
+  // It sits beside the config dir (~/.claude.json next to ~/.claude/), so derive
+  // it from the root's parent. That keeps --root scans hermetic for fixtures.
+  const claudeJsonPath = join(dirname(userDir), '.claude.json');
+  const claudeJson = readJson(claudeJsonPath);
+  if (claudeJson) {
+    eachServer(claudeJson.mcpServers, (n, c) => push(n, c, 'global', scrub(claudeJsonPath)));
+    const projects = claudeJson.projects;
+    if (projects && typeof projects === 'object') {
+      const active = projectPath || process.cwd();
+      for (const [path, cfg] of Object.entries(projects)) {
+        eachServer(cfg?.mcpServers, (n, c) =>
+          push(n, c, 'project', scrub(claudeJsonPath), {
+            projectPath: scrub(path),
+            active: path === active,
+          }));
+      }
     }
   }
+
+  // (4) plugin-bundled servers — only meaningful when the plugin is enabled
+  const enabledMap = {};
+  for (const { data } of settingsFiles) {
+    const ep = data?.enabledPlugins;
+    if (ep && typeof ep === 'object' && !Array.isArray(ep)) Object.assign(enabledMap, ep);
+  }
+  const pluginEnabled = (owner) => {
+    const hit = Object.keys(enabledMap).find((k) => k.split('@')[0] === owner || k.split('@')[1] === owner);
+    return hit ? Boolean(enabledMap[hit]) : null;
+  };
+  for (const base of ['marketplaces', 'cache']) {
+    const dir = join(userDir, 'plugins', base);
+    for (const entry of listDir(dir)) {
+      for (const candidate of [join(dir, entry, '.mcp.json'), ...listDir(join(dir, entry)).map((sub) => join(dir, entry, sub, '.mcp.json'))]) {
+        const data = readJson(candidate);
+        if (!data) continue;
+        const owner = basename(candidate.replace(/\/.mcp\.json$/, ''));
+        const enabled = pluginEnabled(owner);
+        eachServer(data.mcpServers, (n, c) =>
+          push(n, c, 'plugin', scrub(candidate), { plugin: owner, enabled }));
+      }
+    }
+  }
+
+  // (5) explicit .mcp.json next to a config root
   for (const { label, dir } of roots) {
     const mcpFile = join(dir, '.mcp.json');
     const data = readJson(mcpFile);
-    const servers = data?.mcpServers;
-    if (servers && typeof servers === 'object') {
-      for (const [name, cfg] of Object.entries(servers)) push(name, cfg, label, scrub(mcpFile));
-    }
+    eachServer(data?.mcpServers, (n, c) => push(n, c, `file (${label})`, scrub(mcpFile)));
   }
-  return items.length ? ok(items) : unconfigured('no MCP servers configured');
+
+  // Same server can be declared in more than one place; keep the first, note the rest.
+  const seen = new Map();
+  for (const it of items) {
+    const prev = seen.get(it.name);
+    if (!prev) seen.set(it.name, it);
+    else (prev.alsoDeclaredIn ||= []).push(it.origin);
+  }
+  const unique = [...seen.values()];
+
+  const caveat = 'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned server-side and cannot be detected from configuration files.';
+  if (!unique.length) return unconfigured('no MCP servers found in settings, ~/.claude.json, or plugins', { caveat });
+
+  const byOrigin = {};
+  for (const m of unique) byOrigin[m.origin] = (byOrigin[m.origin] || 0) + 1;
+  const inactive = unique.filter((m) => m.enabled === false || (m.origin === 'project' && m.active === false)).length;
+  return ok(unique, { byOrigin, inactive, caveat });
 }
 
 function scanEnvironment(settingsFiles) {
@@ -528,8 +614,8 @@ function main() {
       environment: layer(() => scanEnvironment(settingsFiles), 'environment'),
       commands,
       skills,
-      plugins: layer(() => scanPlugins(userDir), 'plugins'),
-      mcp: layer(() => scanMcp(settingsFiles, roots), 'mcp'),
+      plugins: layer(() => scanPlugins(userDir, settingsFiles), 'plugins'),
+      mcp: layer(() => scanMcp(settingsFiles, roots, userDir, opts.project), 'mcp'),
       rules,
       orchestrators: layer(() => scanProseLayer('orchestrators', { skills, commands, agents, rules }), 'orchestrators'),
       review: layer(() => scanProseLayer('review', { skills, commands, agents, rules }), 'review'),

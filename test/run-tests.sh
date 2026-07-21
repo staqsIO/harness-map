@@ -55,6 +55,22 @@ check "$(j "$TMP/rich.json" "d['layers']['mcp']['items'][0]['envKeys']==['API_TO
 node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" --include-values > "$TMP/raw.json"
 check "$(grep -qE 'sk-supersecret|ghp_ABCDEF' "$TMP/raw.json" && echo true || echo false)" "--include-values opts out of redaction"
 
+# --- 2b. MCP discovery across all four declaration sites ----------------------
+# Regression: an earlier build read only settings.json and undercounted 14 -> 1.
+echo "[mcp discovery]"
+check "$(j "$TMP/rich.json" "d['layers']['mcp']['count']==4")" "finds servers in all four sources"
+for pair in "leaky:settings (user)" "globalsrv:global" "projsrv:project" "pluginsrv:plugin"; do
+  name="${pair%%:*}"; origin="${pair#*:}"
+  check "$(j "$TMP/rich.json" "any(m['name']=='$name' and m['origin']=='$origin' for m in d['layers']['mcp']['items'])")" \
+        "discovers '$name' from origin '$origin'"
+done
+check "$(j "$TMP/rich.json" "any(m['name']=='pluginsrv' and m['enabled'] is False for m in d['layers']['mcp']['items'])")" \
+      "marks servers from a disabled plugin as inactive"
+check "$(j "$TMP/rich.json" "'connectors' in d['layers']['mcp'].get('caveat','').lower()")" \
+      "states the account-connector caveat"
+check "$(j "$TMP/min.json" "d['layers']['mcp']['status']=='unconfigured'")" \
+      "--root stays hermetic (no bleed from the real ~/.claude.json)"
+
 # --- 3. malformed input ------------------------------------------------------
 echo "[resilience]"
 check "$(j "$TMP/rich.json" "len(d['layers']['agents']['items'])==1")" "agent with unterminated frontmatter is skipped, not fatal"

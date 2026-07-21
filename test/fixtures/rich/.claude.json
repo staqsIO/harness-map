@@ -1,0 +1,7 @@
+{
+  "mcpServers": { "globalsrv": { "command": "node", "args": ["g.js"] } },
+  "projects": {
+    "/tmp/projA": { "mcpServers": { "projsrv": { "command": "node" } } },
+    "/tmp/projB": {}
+  }
+}

@@ -296,15 +296,33 @@ function viewInventory() {
     `<div class="pills">${l.items.map((c) => `<span class="pill"><span class="mono">${esc(c.name)}</span></span>`).join('')}</div>`);
 
   const plugins = inventoryBlock('Plugins', L.plugins, (l) => `
-    <div class="pills">${l.items.map((p) => `<span class="pill"><span class="mono">${esc(p.name)}</span><span class="pill-kind">${esc(p.marketplace ?? '')}</span></span>`).join('')}</div>
+    ${l.disabled?.length ? `<p class="note"><strong>${l.disabled.length}</strong> installed but disabled: ${l.disabled.map((d) => `<code>${esc(d)}</code>`).join(' ')} — their commands, skills and MCP servers are inert.</p>` : ''}
+    <div class="pills">${l.items.map((p) => `<span class="pill${p.enabled === false ? ' off' : ''}">
+      <span class="mono">${esc(p.name)}</span><span class="pill-kind">${esc(p.marketplace ?? '')}</span></span>`).join('')}</div>
     ${l.marketplaces?.length ? `<h4>Marketplaces</h4><div class="scroll"><table><thead><tr><th>Name</th><th>Type</th><th>Source</th></tr></thead><tbody>
       ${l.marketplaces.map((m) => `<tr><td class="mono strong">${esc(m.name)}</td><td class="mono dim">${esc(m.type ?? '')}</td><td class="mono">${esc(m.repo ?? '')}</td></tr>`).join('')}
     </tbody></table></div>` : ''}`);
 
-  const mcp = inventoryBlock('MCP servers', L.mcp, (l) =>
-    `<div class="scroll"><table><thead><tr><th>Server</th><th>Transport</th><th>Env keys</th></tr></thead><tbody>
-      ${l.items.map((m) => `<tr><td class="mono strong">${esc(m.name)}</td><td class="mono dim">${esc(m.transport ?? '')}</td><td class="mono dim">${esc((m.envKeys ?? []).join(', ') || '—')}</td></tr>`).join('')}
-    </tbody></table></div>`);
+  const mcpOrigin = (m) => {
+    if (m.origin === 'plugin') return `plugin: ${m.plugin}`;
+    if (m.origin === 'project') return `project: ${m.projectPath}`;
+    return m.origin;
+  };
+  const mcp = inventoryBlock('MCP servers', L.mcp, (l) => `
+    ${l.byOrigin ? `<div class="pills">${Object.entries(l.byOrigin).map(([o, n]) =>
+      `<span class="pill"><span class="pill-kind">${esc(o)}</span><span class="pill-n">${n}</span></span>`).join('')}</div>` : ''}
+    <div class="scroll"><table><thead><tr><th>Server</th><th>Declared in</th><th>Transport</th><th>State</th></tr></thead><tbody>
+      ${l.items.map((m) => {
+        const off = m.enabled === false;
+        return `<tr${off ? ' class="row-off"' : ''}>
+          <td class="mono strong">${esc(m.name)}</td>
+          <td class="mono dim">${esc(mcpOrigin(m))}</td>
+          <td class="mono dim">${esc(m.transport ?? '')}</td>
+          <td>${off ? '<span class="chip neutral">disabled</span>' : '<span class="chip t-2">active</span>'}</td>
+        </tr>`;
+      }).join('')}
+    </tbody></table></div>
+    ${l.caveat ? `<p class="note dim">${esc(l.caveat)}</p>` : ''}`);
 
   const rules = inventoryBlock('Rules & instructions', L.rules, (l) =>
     `<div class="rule-grid">${l.items.map((r) => `<div class="rule-card">
@@ -483,6 +501,8 @@ td.desc{color:var(--ink-2);max-width:460px}
 .pill-kind{font-family:var(--mono);font-size:10px;text-transform:uppercase;
   letter-spacing:.05em;color:var(--ink-3)}
 .pill-n{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600}
+.pill.off{opacity:.5;text-decoration:line-through}
+.row-off td{opacity:.55}
 
 /* lifecycle steps */
 .steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0}
