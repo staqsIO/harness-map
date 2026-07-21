@@ -94,8 +94,14 @@ status-line command, credentials in URL userinfo, a permission rule reading
 The set of things that look like a credential is unbounded, so the guarantee now
 comes from what is *emitted* rather than from what is caught.
 
-**Descriptions are a deliberate exception.** They are authored prose whose purpose
-is to be read for routing, and hiding them would defeat the tool.
+**What this does and does not guarantee.** The allowlist removes the *unbounded*
+disclosure channels — anywhere a credential could hide in a value you did not
+write by hand. It does not, and cannot, vet the free-form text you authored
+yourself: agent and skill **names**, their **descriptions**, and rule-file
+**headings** are emitted, because they are the map. If you named a skill after a
+client or wrote a token into a description, that travels with the page. So the
+honest claim is not "safe to share with anyone" — it is "contains the names and
+descriptions you wrote, and nothing else you didn't."
 
 `--include-values` opts out entirely. Output produced that way must not be shared.
 

@@ -123,6 +123,37 @@ const CHECKS = [
       : { status: FAIL, detail: 'guards unverified — re-run with --probe-hooks to establish blocking behaviour', evidence: ['scan-harness.mjs --probe-hooks'] }),
   },
 
+  // --- hook contract --------------------------------------------------------
+  // These two are static: they need no probing and catch a guard that cannot
+  // possibly work. Both were found in the author's own config, where five
+  // documented "hook-enforced" protections were enforcing nothing.
+  {
+    id: 'hooks.reads-documented-input',
+    severity: 'high',
+    title: 'No hook depends on a $TOOL_INPUT environment variable',
+    why: 'Claude Code delivers hook data as JSON on stdin. $TOOL_INPUT is not a documented variable and is not set, so a hook reading it inspects an empty string and silently never matches — the guard looks configured and does nothing.',
+    applies: () => okLayer('hooks') && Boolean(L.hooks.defects),
+    run: () => {
+      const bad = L.hooks.defects.readsToolInputEnv ?? [];
+      return bad.length
+        ? { status: FAIL, detail: `${bad.length} hook(s) read $TOOL_INPUT with no stdin fallback`, evidence: bad }
+        : { status: PASS, detail: 'all hooks read their event from stdin' };
+    },
+  },
+  {
+    id: 'hooks.blocking-exit-code',
+    severity: 'high',
+    title: 'PreToolUse hooks that intend to block use exit 2',
+    why: 'Only exit code 2 blocks a tool call. Exit 1 is treated as a non-blocking hook error: it is logged and the tool runs anyway, so a guard that exits 1 permits exactly what it was written to prevent.',
+    applies: () => okLayer('hooks') && Boolean(L.hooks.defects),
+    run: () => {
+      const bad = L.hooks.defects.nonBlockingExit ?? [];
+      return bad.length
+        ? { status: FAIL, detail: `${bad.length} PreToolUse hook(s) exit 1 and never block`, evidence: bad }
+        : { status: PASS, detail: 'no PreToolUse hook relies on a non-blocking exit code' };
+    },
+  },
+
   // --- config integrity -----------------------------------------------------
   {
     id: 'hooks.scripts-resolve',
@@ -243,8 +274,8 @@ const CHECKS = [
     why: 'Duplicate declarations make precedence ambiguous and one copy silently wins.',
     applies: () => okLayer('mcp'),
     run: () => {
-      const dup = L.mcp.items.filter((m) => m.alsoDeclaredIn?.length)
-        .map((m) => `${m.name}: ${[m.origin, ...m.alsoDeclaredIn].join(' + ')}`);
+      const dup = L.mcp.items.filter((m) => m.shadowed?.length)
+        .map((m) => `${m.name}: ${m.origin} shadows ${m.shadowed.join(', ')}`);
       return dup.length
         ? { status: FAIL, detail: `${dup.length} server(s) declared more than once`, evidence: dup }
         : { status: PASS, detail: 'each server declared once' };

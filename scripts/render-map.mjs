@@ -13,7 +13,7 @@
  *   node render-map.mjs --scan scan.json [--prose prose.json] [--out map.html]
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // args
@@ -34,8 +34,16 @@ if (!scanPath || argv.includes('--help')) {
   process.exit(scanPath ? 0 : 1);
 }
 
+// Bounded: --scan/--prose/--audit are public entry points and may be handed a
+// substituted or malformed artifact. An unbounded readFileSync on a 500MB file
+// blocks the process before any validation runs.
+const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const readJson = (p, fallback = null) => {
-  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return fallback; }
+  try {
+    const st = statSync(p);
+    if (!st.isFile() || st.size > MAX_INPUT_BYTES) return fallback;
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch { return fallback; }
 };
 
 const scan = readJson(scanPath);
@@ -56,6 +64,19 @@ const esc = (s) =>
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
+/**
+ * Numeric interpolation sink. The scan and audit documents are untrusted input —
+ * they may be substituted or hand-edited — so a field that "should" be a count
+ * cannot be interpolated raw. `summary.passed` reaching HTML unescaped was a
+ * live injection path even though it is only ever written as a number.
+ */
+const num = (v, fallback = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+/** Clamp for CSS numeric contexts (width, flex), where even a number needs bounds. */
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, num(v, lo)));
+
 const has = (layer) => layer?.status === 'ok';
 const statusOf = (layer) => layer?.status ?? 'unconfigured';
 
@@ -68,8 +89,8 @@ function cmdLabel(c) {
   if (c.raw) return c.raw; // only present when the scan ran --include-values
   const parts = [c.exe].filter(Boolean);
   if (c.script && c.script !== c.exe) parts.push(c.script);
-  const label = parts.join(' → ') || 'command';
-  return c.length ? `${label}  (${c.length} chars, hidden)` : label;
+  const label = esc(parts.join(' → ') || 'command');
+  return c.length ? `${label}  (${num(c.length)} chars, hidden)` : label;
 }
 
 /** Empty state: says what's missing and what would populate it. Never invents. */
@@ -118,16 +139,16 @@ function viewAgents() {
 
   const ramp = `<div class="ramp">${Object.entries(byModel)
     .sort((a, b) => (TIER_RANK[a[0]] ?? 9) - (TIER_RANK[b[0]] ?? 9))
-    .map(([model, n]) => `<div class="ramp-seg ${tierClass(model)}" style="flex:${n}">
-        <span class="ramp-label">${esc(model)}</span><span class="ramp-n">${n}</span>
+    .map(([model, n]) => `<div class="ramp-seg ${tierClass(model)}" style="flex:${clamp(n, 0, 1000)}">
+        <span class="ramp-label">${esc(model)}</span><span class="ramp-n">${num(n)}</span>
       </div>`).join('')}</div>`;
 
   const warnings = [];
   if (layer.bareInherit?.length) {
-    warnings.push(`<p class="warn"><strong>${layer.bareInherit.length}</strong> agent(s) on bare <code>inherit</code> — they silently bind to the session model: ${layer.bareInherit.map(esc).join(', ')}</p>`);
+    warnings.push(`<p class="warn"><strong>${num(layer.bareInherit.length)}</strong> agent(s) on bare <code>inherit</code> — they silently bind to the session model: ${layer.bareInherit.map(esc).join(', ')}</p>`);
   }
   if (layer.unpinned?.length) {
-    warnings.push(`<p class="warn"><strong>${layer.unpinned.length}</strong> agent(s) with no <code>model:</code> field: ${layer.unpinned.map(esc).join(', ')}</p>`);
+    warnings.push(`<p class="warn"><strong>${num(layer.unpinned.length)}</strong> agent(s) with no <code>model:</code> field: ${layer.unpinned.map(esc).join(', ')}</p>`);
   }
 
   const rows = layer.items.map((a) => `<tr>
@@ -172,7 +193,7 @@ function viewHooks() {
     const perms = envLayer.permissions ?? {};
     const compact = env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
     const compactNote = compact
-      ? `<p class="note">Auto-compact fires at roughly <strong>84%</strong> of this value — about <strong>${Math.round(Number(compact) * 0.84 / 1000)}k</strong> tokens.</p>`
+      ? `<p class="note">Auto-compact fires at roughly <strong>84%</strong> of this value — about <strong>${Math.round(num(compact) * 0.84 / 1000)}k</strong> tokens.</p>`
       : '';
     const topTools = Object.entries(perms.toolBreakdown ?? {}).sort((a, b) => b[1] - a[1]).slice(0, 8);
     envPanel = `<section class="block">
@@ -180,7 +201,7 @@ function viewHooks() {
       <dl class="kv">
         <dt>Model</dt><dd class="mono">${esc(envLayer.model ?? '—')}</dd>
         <dt>Permission mode</dt><dd class="mono">${esc(perms.defaultMode ?? '—')}</dd>
-        <dt>Allow rules</dt><dd class="mono">${perms.allow ?? 0}</dd>
+        <dt>Allow rules</dt><dd class="mono">${num(perms.allow)}</dd>
         ${envLayer.statusLine ? `<dt>Status line</dt><dd class="mono dim">${esc(cmdLabel(envLayer.statusLine.command))}</dd>` : ''}
       </dl>
       ${Object.keys(env).length ? `<div class="scroll"><table><thead><tr><th>Env var</th><th>Value</th></tr></thead><tbody>
@@ -188,7 +209,7 @@ function viewHooks() {
       </tbody></table></div>` : ''}
       ${compactNote}
       ${topTools.length ? `<h4>Pre-approved tools</h4><div class="pills">${topTools.map(([t, n]) =>
-        `<span class="pill"><span class="mono">${esc(t)}</span><span class="pill-n">${n}</span></span>`).join('')}</div>` : ''}
+        `<span class="pill"><span class="mono">${esc(t)}</span><span class="pill-n">${num(n)}</span></span>`).join('')}</div>` : ''}
     </section>`;
   }
 
@@ -214,14 +235,14 @@ function viewHooks() {
       <div class="step-head">
         <span class="step-n mono">${String(i + 1).padStart(2, '0')}</span>
         <span class="step-name mono">${esc(event)}</span>
-        <span class="step-count">${list.length}</span>
+        <span class="step-count">${num(list.length)}</span>
       </div>
       ${caption ? `<p class="step-caption">${esc(caption)}</p>` : ''}
       <ul class="hook-list">
         ${list.map((h) => `<li class="hook">
           <span class="matcher mono">${esc(h.matcher)}</span>
           <code class="cmd">${esc(cmdLabel(h.command))}</code>
-          ${h.timeout ? `<span class="tag mono">${h.timeout}ms</span>` : '<span class="tag mono dim">no timeout</span>'}
+          ${h.timeout ? `<span class="tag mono">${num(h.timeout)}ms</span>` : '<span class="tag mono dim">no timeout</span>'}
         </li>`).join('')}
       </ul>
     </li>`;
@@ -229,7 +250,7 @@ function viewHooks() {
 
   return `${envPanel}
     <section class="block">
-      <h3>Hook lifecycle <span class="dim mono">${hooks.count} hooks across ${Object.keys(byEvent).length} events</span></h3>
+      <h3>Hook lifecycle <span class="dim mono">${num(hooks.count)} hooks across ${Object.keys(byEvent).length} events</span></h3>
       <ol class="steps">${steps}</ol>
     </section>`;
 }
@@ -303,7 +324,7 @@ function viewReview() {
 
 function inventoryBlock(title, layer, render) {
   if (!has(layer)) return `<section class="block"><h3>${esc(title)}</h3>${emptyState(layer, { title: `No ${title.toLowerCase()}` })}</section>`;
-  return `<section class="block"><h3>${esc(title)} <span class="dim mono">${layer.count}</span></h3>${render(layer)}</section>`;
+  return `<section class="block"><h3>${esc(title)} <span class="dim mono">${num(layer.count)}</span></h3>${render(layer)}</section>`;
 }
 
 function viewInventory() {
@@ -311,7 +332,7 @@ function viewInventory() {
     `<div class="pills">${l.items.map((c) => `<span class="pill"><span class="mono">${esc(c.name)}</span></span>`).join('')}</div>`);
 
   const plugins = inventoryBlock('Plugins', L.plugins, (l) => `
-    ${l.disabled?.length ? `<p class="note"><strong>${l.disabled.length}</strong> installed but disabled: ${l.disabled.map((d) => `<code>${esc(d)}</code>`).join(' ')} — their commands, skills and MCP servers are inert.</p>` : ''}
+    ${l.disabled?.length ? `<p class="note"><strong>${num(l.disabled.length)}</strong> installed but disabled: ${l.disabled.map((d) => `<code>${esc(d)}</code>`).join(' ')} — their commands, skills and MCP servers are inert.</p>` : ''}
     <div class="pills">${l.items.map((p) => `<span class="pill${p.enabled === false ? ' off' : ''}">
       <span class="mono">${esc(p.name)}</span><span class="pill-kind">${esc(p.marketplace ?? '')}</span></span>`).join('')}</div>
     ${l.marketplaces?.length ? `<h4>Marketplaces</h4><div class="scroll"><table><thead><tr><th>Name</th><th>Type</th><th>Source</th></tr></thead><tbody>
@@ -324,7 +345,7 @@ function viewInventory() {
   };
   const mcp = inventoryBlock('MCP servers', L.mcp, (l) => `
     ${l.byOrigin ? `<div class="pills">${Object.entries(l.byOrigin).map(([o, n]) =>
-      `<span class="pill"><span class="pill-kind">${esc(o)}</span><span class="pill-n">${n}</span></span>`).join('')}</div>` : ''}
+      `<span class="pill"><span class="pill-kind">${esc(o)}</span><span class="pill-n">${num(n)}</span></span>`).join('')}</div>` : ''}
     <div class="scroll"><table><thead><tr><th>Server</th><th>Resolved from</th><th>Transport</th><th>State</th></tr></thead><tbody>
       ${l.items.map((m) => {
         const off = m.active === false;
@@ -336,7 +357,7 @@ function viewInventory() {
         </tr>`;
       }).join('')}
     </tbody></table></div>
-    ${l.otherProjectServers ? `<p class="note">${l.otherProjectServers} further server(s) are configured for ${l.otherProjects} other project(s). Those paths are not shown, and those servers do not load here.</p>` : ''}
+    ${l.otherProjectServers ? `<p class="note">${num(l.otherProjectServers)} further server(s) are configured for ${num(l.otherProjects)} other project(s). Those paths are not shown, and those servers do not load here.</p>` : ''}
     ${l.caveat ? `<p class="note dim">${esc(l.caveat)}</p>` : ''}`);
 
   const rules = inventoryBlock('Rules & instructions', L.rules, (l) =>
@@ -346,7 +367,7 @@ function viewInventory() {
     </div>`).join('')}</div>`);
 
   const skills = has(L.skills)
-    ? `<section class="block"><h3>Skills <span class="dim mono">${L.skills.count}</span></h3>
+    ? `<section class="block"><h3>Skills <span class="dim mono">${num(L.skills.count)}</span></h3>
        <p class="note">${esc(L.skills.items.slice(0, 40).map((s) => s.name).join(' · '))}${L.skills.count > 40 ? ` … and ${L.skills.count - 40} more` : ''}</p></section>`
     : inventoryBlock('Skills', L.skills, () => '');
 
@@ -366,7 +387,10 @@ function viewAudit() {
     </div>`;
   }
   const s = audit.summary ?? {};
-  const pct = s.applicable ? Math.round((s.passed / s.applicable) * 100) : 0;
+  const sPassed = num(s.passed);
+  const sApplicable = num(s.applicable);
+  const sNa = num(s.notApplicable);
+  const pct = sApplicable ? clamp(Math.round((sPassed / sApplicable) * 100), 0, 100) : 0;
 
   const finding = (f) => `<li class="finding sev-${esc(f.severity)}">
       <div class="finding-head">
@@ -385,24 +409,24 @@ function viewAudit() {
       <h3>Result</h3>
       <div class="audit-head">
         <div class="audit-score">
-          <span class="audit-n mono">${s.passed}<span class="audit-of">/${s.applicable}</span></span>
+          <span class="audit-n mono">${sPassed}<span class="audit-of">/${sApplicable}</span></span>
           <span class="audit-cap">applicable checks pass</span>
         </div>
         <div class="audit-bar" role="img" aria-label="${pct} percent of applicable checks pass">
           <div class="audit-fill" style="width:${pct}%"></div>
         </div>
         <div class="pills">
-          <span class="pill sev-chip sev-high"><span class="pill-kind">high</span><span class="pill-n">${s.failedBySeverity?.high ?? 0}</span></span>
-          <span class="pill sev-chip sev-medium"><span class="pill-kind">medium</span><span class="pill-n">${s.failedBySeverity?.medium ?? 0}</span></span>
-          <span class="pill sev-chip sev-low"><span class="pill-kind">low</span><span class="pill-n">${s.failedBySeverity?.low ?? 0}</span></span>
-          ${s.notApplicable ? `<span class="pill"><span class="pill-kind">n/a</span><span class="pill-n">${s.notApplicable}</span></span>` : ''}
+          <span class="pill sev-chip sev-high"><span class="pill-kind">high</span><span class="pill-n">${num(s.failedBySeverity?.high)}</span></span>
+          <span class="pill sev-chip sev-medium"><span class="pill-kind">medium</span><span class="pill-n">${num(s.failedBySeverity?.medium)}</span></span>
+          <span class="pill sev-chip sev-low"><span class="pill-kind">low</span><span class="pill-n">${num(s.failedBySeverity?.low)}</span></span>
+          ${sNa ? `<span class="pill"><span class="pill-kind">n/a</span><span class="pill-n">${sNa}</span></span>` : ''}
         </div>
       </div>
       <p class="note dim">There is no weighted score. Each check is a named assertion that passes, fails, or does not apply, so the ratio means exactly what it says and nothing more.</p>
     </section>
     ${findings ? `<section class="block"><h3>Findings</h3><ul class="findings">${findings}</ul></section>`
                : `<section class="block"><h3>Findings</h3><p class="note">Every applicable check passes.</p></section>`}
-    ${audit.passing?.length ? `<section class="block"><h3>Passing <span class="dim mono">${audit.passing.length}</span></h3>
+    ${audit.passing?.length ? `<section class="block"><h3>Passing <span class="dim mono">${num(audit.passing.length)}</span></h3>
       <ul class="passlist">${audit.passing.map((p) => `<li><span class="mono">${esc(p.id)}</span> <span class="dim">${esc(p.detail ?? '')}</span></li>`).join('')}</ul></section>` : ''}`;
 }
 

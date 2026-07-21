@@ -124,8 +124,20 @@ Do not editorialize beyond what the scan shows.
 
 ## Privacy
 
-Output is redacted by default: home paths collapse to `~`, values under
-secret-shaped keys become `<redacted>`, MCP args/env values are dropped in favor
-of key names, permission rules reduce to per-tool counts, and hook commands are
-truncated to a preview. Artifacts are private until shared, but treat the page as
-shareable and keep it redacted unless told otherwise.
+The scanner emits an **allowlist** of structurally safe shapes. It does not try
+to detect secrets — that approach failed review, because an ordinary key name can
+hold a credential.
+
+**Never emitted by default:** environment values (outside a short allowlist of
+non-sensitive Claude Code variables), hook and status-line command text, MCP URLs
+and hostnames, permission rule arguments, absolute paths, and other projects'
+paths.
+
+**Deliberately emitted:** the names you authored (agents, skills, commands,
+servers, plugins), their descriptions, and rule-file headings. These are the map.
+They are also free-form text you wrote, so a page is only as shareable as those
+names are — say so when the user asks about sharing, rather than calling the
+output universally safe.
+
+`--include-values` disables the allowlist entirely; output from it must not be
+shared. Artifacts are private until the user shares them.

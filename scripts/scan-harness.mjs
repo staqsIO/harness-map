@@ -45,7 +45,9 @@ const HOME = homedir();
 
 // Resource budgets. Without these a 500MB claude.json blocks the host process.
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
-const MAX_DIR_ENTRIES = 2000;
+const MAX_DIR_ENTRIES = 2000;   // per readdir
+const MAX_WALK_DIRS = 5000;     // global: directories entered in one walk
+const MAX_WALK_ENTRIES = 50000; // global: entries examined in one walk
 const MAX_WALK_DEPTH = 3;
 const PROBE_TIMEOUT_MS = 2000;
 
@@ -102,25 +104,32 @@ const listDir = (p) => { try { return readdirSync(p).slice(0, MAX_DIR_ENTRIES); 
  * Recursively collect files with an extension. Skips symlinked directories and
  * tracks visited inodes, so a symlink loop or a fan-out farm cannot spin here.
  */
-function walk(dir, ext, maxDepth = MAX_WALK_DEPTH, depth = 0, out = [], seen = new Set()) {
-  if (depth > maxDepth || out.length > MAX_DIR_ENTRIES) return out;
-  let key;
+function walk(dir, ext, maxDepth = MAX_WALK_DEPTH, depth = 0, out = [], seen = new Set(), budget = null) {
+  // The budget must count entries EXAMINED, globally — not matching files found.
+  // A tree of 2000 directories each holding 2000 more contains no `.md` files, so
+  // a `out.length` cap never trips while millions of entries are walked.
+  const b = budget ?? { entries: 0, dirs: 0, exhausted: false };
+  if (depth > maxDepth || b.exhausted) return out;
+  if (b.dirs++ > MAX_WALK_DIRS) { b.exhausted = true; return out; }
+
   try {
     const st = lstatSync(dir);
     if (!st.isDirectory()) return out;
-    key = `${st.dev}:${st.ino}`;
+    const key = `${st.dev}:${st.ino}`;
     if (seen.has(key)) return out;
     seen.add(key);
   } catch { return out; }
 
   for (const entry of listDir(dir)) {
+    if (b.entries++ > MAX_WALK_ENTRIES) { b.exhausted = true; return out; }
     if (entry.startsWith('.') || entry === 'node_modules') continue;
     const full = join(dir, entry);
     let st;
     try { st = lstatSync(full); } catch { continue; }
     if (st.isSymbolicLink()) continue; // never follow links out of the config tree
-    if (st.isDirectory()) walk(full, ext, maxDepth, depth + 1, out, seen);
+    if (st.isDirectory()) walk(full, ext, maxDepth, depth + 1, out, seen, b);
     else if (st.isFile() && extname(entry) === ext) out.push(full);
+    if (b.exhausted) return out;
   }
   return out;
 }
@@ -254,8 +263,15 @@ function parseFrontmatter(text) {
   if (!m) return null;
 
   const fm = {};
-  const warnings = [];
   const lines = m[1].split(/\r?\n/);
+  // ALL-OR-NOTHING: any construct outside the supported subset rejects the whole
+  // block. Returning a partially-guessed object is how a wrong `model:` or a
+  // truncated `description:` reaches the audit and becomes a false assertion.
+  const reject = (reason) => {
+    const out = {};
+    Object.defineProperty(out, '__rejected', { value: reason, enumerable: false });
+    return out;
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -264,60 +280,77 @@ function parseFrontmatter(text) {
     const kv = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
     if (!kv) continue;
     const key = kv[1];
-    let value = kv[2].trim();
+    let value = kv[2];
 
-    if (Object.prototype.hasOwnProperty.call(fm, key)) {
-      warnings.push(`duplicate key '${key}'`);
-      continue;
-    }
+    if (Object.prototype.hasOwnProperty.call(fm, key)) return reject(`duplicate key '${key}'`);
 
-    if (value === '') {
-      // Could be YAML null or the start of a nested block; either way there is
-      // no scalar here. Record null rather than an empty string.
-      const next = lines[i + 1];
-      if (next && /^\s+\S/.test(next)) { fm[key] = null; continue; }
-      fm[key] = null;
-      continue;
-    }
-    if (value.startsWith('&') || value.startsWith('*') || value.startsWith('!')) {
-      warnings.push(`unsupported anchor/alias/tag for '${key}'`);
-      continue;
-    }
-
-    const block = value.match(/^([>|])([0-9]*)([-+]?)$/);
-    if (block) {
-      if (block[2]) { warnings.push(`indentation indicator unsupported for '${key}'`); continue; }
-      const body = [];
+    const blockHeader = value.trim().match(/^([>|])([0-9]*)([-+]?)(\s+#.*)?$/);
+    if (blockHeader) {
+      if (blockHeader[2]) return reject(`indentation indicator unsupported ('${key}')`);
+      const chomp = blockHeader[3];
+      const raw = [];
       while (i + 1 < lines.length) {
         const next = lines[i + 1];
         if (next.trim() && !/^\s/.test(next)) break;
-        body.push(next.replace(/^\s{0,8}/, ''));
+        raw.push(next);
         i++;
       }
+      // Base indent is the first non-empty line's indent — a fixed strip width
+      // destroys meaningful relative indentation inside a literal block.
+      const firstContent = raw.find((l) => l.trim());
+      const baseIndent = firstContent ? (firstContent.match(/^\s*/)?.[0].length ?? 0) : 0;
+      const body = raw.map((l) => (l.trim() ? l.slice(baseIndent) : ''));
       while (body.length && !body[body.length - 1].trim()) body.pop();
-      if (block[1] === '>') {
-        // Folded: blank lines are paragraph breaks and must survive folding.
-        const paras = body.join('\n').split(/\n\s*\n/).map((p) => p.replace(/\s+/g, ' ').trim());
-        value = paras.filter(Boolean).join('\n\n');
+
+      if (blockHeader[1] === '>') {
+        value = body.join('\n').split(/\n\s*\n/)
+          .map((p) => p.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n\n');
       } else {
         value = body.join('\n');
       }
-      if (block[3] === '-') value = value.replace(/\n+$/, '');
+      if (chomp === '+') {
+        const trailing = raw.length - body.length;
+        value += '\n'.repeat(Math.max(0, trailing));
+      } else if (chomp !== '-') {
+        value += '\n'; // clip: exactly one trailing newline
+      }
       fm[key] = value;
       continue;
     }
 
-    if (value.startsWith('"') && value.endsWith('"') && value.length > 1) {
-      if (value.includes('\\')) { warnings.push(`escape sequences unsupported for '${key}'`); continue; }
-      value = value.slice(1, -1);
-    } else if (value.startsWith("'") && value.endsWith("'") && value.length > 1) {
-      value = value.slice(1, -1).replace(/''/g, "'");
+    value = value.trim();
+    if (value === '') { fm[key] = null; continue; }
+    if (value.startsWith('&') || value.startsWith('*') || value.startsWith('!')) {
+      return reject(`anchor/alias/tag unsupported ('${key}')`);
     }
+    if (value.startsWith('[') || value.startsWith('{')) return reject(`flow collection unsupported ('${key}')`);
+
+    if (value.startsWith('"')) {
+      if (!value.endsWith('"') || value.length < 2) return reject(`unterminated double quote ('${key}')`);
+      if (value.slice(1, -1).includes('\\')) return reject(`escape sequences unsupported ('${key}')`);
+      fm[key] = value.slice(1, -1);
+      continue;
+    }
+    if (value.startsWith("'")) {
+      if (!value.endsWith("'") || value.length < 2) return reject(`unterminated single quote ('${key}')`);
+      fm[key] = value.slice(1, -1).replace(/''/g, "'");
+      continue;
+    }
+
+    // Plain scalar: ` #` begins a comment in YAML, so it is not part of the value.
+    value = value.replace(/\s+#.*$/, '').trim();
+    if (/^(null|Null|NULL|~)$/.test(value)) { fm[key] = null; continue; }
     fm[key] = value;
   }
-
-  Object.defineProperty(fm, '__warnings', { value: warnings, enumerable: false });
   return fm;
+}
+
+/** Reads frontmatter, returning `{fm, warning}` so callers can report rejections. */
+function frontmatterOf(file) {
+  const fm = parseFrontmatter(readTextBounded(file));
+  if (!fm) return { fm: null, warning: null };
+  if (fm.__rejected) return { fm: null, warning: fm.__rejected };
+  return { fm, warning: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +390,9 @@ function scanAgents(roots) {
     const agentsDir = join(dir, 'agents');
     if (!isDir(agentsDir)) continue;
     for (const file of walk(agentsDir, '.md', 2)) {
-      const fm = parseFrontmatter(readTextBounded(file));
+      const { fm, warning } = frontmatterOf(file);
+      if (warning) { parseWarnings.push({ file: pathOf(file), warnings: [warning] }); continue; }
       if (!fm) continue;
-      if (fm.__warnings?.length) parseWarnings.push({ file: pathOf(file), warnings: fm.__warnings });
       items.push({
         name: ident(fm.name || basename(file, '.md')),
         model: fm.model ? ident(fm.model, 40) : null,
@@ -426,10 +459,47 @@ function scanHooks(settingsFiles) {
     }
   }
 
+  // Two static defects that silently disable a guard. Both are computed from the
+  // full command text, which never leaves this function.
+  //
+  // 1. $TOOL_INPUT — Claude Code delivers hook data as JSON on STDIN. There is no
+  //    such environment variable, so a hook reading it inspects an empty string
+  //    and never matches. A stdin read anywhere in the command clears the flag.
+  // 2. exit 1 — only exit 2 blocks a PreToolUse call. Exit 1 is a NON-blocking
+  //    error: Claude Code logs it and runs the tool anyway.
+  const defects = { readsToolInputEnv: [], nonBlockingExit: [] };
+  const inspect = (event, matcher, command, scriptPath) => {
+    const label = scriptPath ? basename(scriptPath) : `${event}[${matcher || 'all'}] inline`;
+    let text = command;
+    if (scriptPath && existsSync(scriptPath)) text += '\n' + (readTextBounded(scriptPath) ?? '');
+    const usesEnv = /\$\{?TOOL_INPUT|\$\{?CLAUDE_TOOL_INPUT/.test(text);
+    // `echo "$TOOL_INPUT" | python3 -c '...sys.stdin...'` READS stdin, but the
+    // stdin it reads is the pipe carrying an empty variable — not the hook event.
+    // Treating that as a stdin fallback masked two genuinely broken guards.
+    const pipesEnv = /(?:echo|printf|cat)[^|\n]*\$\{?(?:CLAUDE_)?TOOL_INPUT[^|\n]*\|/.test(text);
+    const readsStdin = /\bcat\b|sys\.stdin|process\.stdin|read -r|readFileSync\(0|\/dev\/stdin/.test(text);
+    if (usesEnv && (pipesEnv || !readsStdin)) defects.readsToolInputEnv.push(ident(label, 60));
+    if (event === 'PreToolUse' && /\bexit\s+1\b/.test(text) && !/\bexit\s+2\b/.test(text)) {
+      defects.nonBlockingExit.push(ident(label, 60));
+    }
+  };
+  for (const { data } of settingsFiles) {
+    for (const [event, entries] of Object.entries(data?.hooks ?? {})) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries) for (const h of e?.hooks ?? []) {
+        if (!h?.command) continue;
+        const cmd = String(h.command);
+        const script = cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/)?.[0] ?? null;
+        inspect(event, e?.matcher, cmd, script);
+      }
+    }
+  }
+
   return ok(items, {
     byEvent,
     events: Object.keys(byEvent).sort(),
     scriptRefs,
+    defects,
     missingTimeout: items.filter((h) => h.timeout == null).length,
   });
 }
@@ -466,28 +536,52 @@ function probeHooks(settingsFiles) {
   }
 
   for (const [pattern, synthetic] of Object.entries(PROBE_COMMANDS)) {
-    const toolInput = JSON.stringify({ tool_name: 'Bash', command: synthetic });
+    // The documented PreToolUse event shape. The command lives at
+    // tool_input.command, NOT at the top level.
+    const event = JSON.stringify({
+      session_id: 'harness-map-probe',
+      hook_event_name: 'PreToolUse',
+      cwd,
+      tool_name: 'Bash',
+      tool_use_id: 'harness-map-probe',
+      tool_input: { command: synthetic, description: 'harness-map verification probe' },
+    });
+
     let blocked = false;
     let ran = 0;
+    let errored = 0;
     for (const command of commands) {
       try {
         const r = spawnSync('sh', ['-c', command], {
           cwd,
           timeout: PROBE_TIMEOUT_MS,
-          stdio: ['ignore', 'ignore', 'ignore'],
+          input: event, // hooks read their event as JSON on stdin
+          stdio: ['pipe', 'pipe', 'pipe'],
+          encoding: 'utf8',
           env: {
             PATH: process.env.PATH ?? '/usr/bin:/bin',
             HOME: process.env.HOME ?? HOME,
-            TOOL_INPUT: toolInput,
-            CLAUDE_TOOL_INPUT: toolInput,
             HARNESS_MAP_PROBE: '1',
           },
         });
         ran++;
-        if (typeof r.status === 'number' && r.status !== 0) blocked = true;
-      } catch { /* a hook that cannot run is not a guard */ }
+        // ONLY exit 2 blocks. Exit 1 (or any other non-zero) is a non-blocking
+        // hook error and the tool call proceeds — counting it as "blocked" was a
+        // false PASS that reported broken guards as working.
+        if (r.status === 2) { blocked = true; continue; }
+        if (r.status === 0) {
+          // A hook may instead deny via structured JSON on stdout, exiting 0.
+          try {
+            const out = JSON.parse(String(r.stdout ?? '').trim() || '{}');
+            const decision = out?.hookSpecificOutput?.permissionDecision ?? out?.decision;
+            if (decision === 'deny') blocked = true;
+          } catch { /* not structured output; exit 0 means allow */ }
+          continue;
+        }
+        errored++;
+      } catch { errored++; }
     }
-    results[pattern] = { blocked, hooksRun: ran };
+    results[pattern] = { blocked, hooksRun: ran, hooksErrored: errored };
   }
   return { probed: true, hookCount: commands.length, results };
 }
@@ -498,7 +592,7 @@ function scanCommands(roots) {
     const cmdDir = join(dir, 'commands');
     if (!isDir(cmdDir)) continue;
     for (const file of walk(cmdDir, '.md', 3)) {
-      const fm = parseFrontmatter(readTextBounded(file)) || {};
+      const fm = frontmatterOf(file).fm || {};
       const rel = relative(cmdDir, file).replace(/\.md$/, '');
       const parts = rel.split(sep);
       const name = parts.length > 1 ? `${parts.slice(0, -1).join(':')}:${parts.at(-1)}` : parts[0];
@@ -522,8 +616,9 @@ function scanSkills(roots) {
     for (const entry of listDir(skillsDir)) {
       const skillFile = join(skillsDir, entry, 'SKILL.md');
       if (!existsSync(skillFile)) continue;
-      const fm = parseFrontmatter(readTextBounded(skillFile)) || {};
-      if (fm.__warnings?.length) parseWarnings.push({ file: pathOf(skillFile), warnings: fm.__warnings });
+      const { fm: parsed, warning } = frontmatterOf(skillFile);
+      if (warning) parseWarnings.push({ file: pathOf(skillFile), warnings: [warning] });
+      const fm = parsed || {};
       items.push({
         name: ident(fm.name || entry),
         description: truncate(fm.description ?? '', 200) || null,
@@ -592,13 +687,17 @@ function scanPlugins(userDir, settingsFiles) {
 function scanMcp(settingsFiles, roots, userDir, projectPath) {
   const layers = { local: [], project: [], user: [], plugin: [] };
   const mk = (name, cfg, origin, extra = {}) => ({
+    key: String(name),
     name: ident(name),
     origin,
     transport: cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null),
     command: cfg?.command ? ident(basename(String(cfg.command)), 40) : null,
     argsCount: Array.isArray(cfg?.args) ? cfg.args.length : 0,
     envKeys: cfg?.env && typeof cfg.env === 'object' ? Object.keys(cfg.env).map((k) => ident(k, 40)) : [],
-    url: describeUrl(cfg?.url),
+    // A hostname can itself be sensitive (customer-acme-prod.internal.…), so the
+    // default emits only whether the server is remote. Host requires opt-in.
+    remote: Boolean(cfg?.url),
+    url: REDACT ? null : (cfg?.url ? String(cfg.url) : null),
     ...extra,
   });
   const each = (obj, fn) => { if (obj && typeof obj === 'object' && !Array.isArray(obj)) for (const [n, c] of Object.entries(obj)) fn(n, c); };
@@ -665,12 +764,14 @@ function scanMcp(settingsFiles, roots, userDir, projectPath) {
   const resolved = new Map();
   for (const scope of ['local', 'project', 'user', 'plugin']) {
     for (const s of layers[scope]) {
-      const prev = resolved.get(s.name);
-      if (!prev) resolved.set(s.name, { ...s, active: s.enabled !== false });
+      // Key on the untruncated name: two servers sharing an 80-char prefix are
+      // distinct servers, and collapsing them hides one from the inventory.
+      const prev = resolved.get(s.key);
+      if (!prev) resolved.set(s.key, { ...s, active: s.enabled !== false });
       else (prev.shadowed ||= []).push(s.origin);
     }
   }
-  const items = [...resolved.values()];
+  const items = [...resolved.values()].map(({ key, ...rest }) => rest);
 
   const caveat = 'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned server-side and cannot be detected from configuration files.';
   if (!items.length) {
