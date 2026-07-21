@@ -97,5 +97,33 @@ check(Array.isArray(gate({ sources: 'nope' }, DOCUMENT, {}).sources),
 check(gate({ layers: { agents: { status: 'ok', items: [null, { name: 'agent-01' }] } } },
   DOCUMENT, {}).layers.agents.items.length === 1, 'null list elements are dropped');
 
+// --- prototype safety -------------------------------------------------------
+// The map emitters build keys from input, so a crafted key must not be able to
+// reach an object's prototype.
+const polluted = gate(
+  JSON.parse('{"layers":{"agents":{"status":"ok","byModel":{"__proto__":1,"constructor":2,"sonnet":3}}}}'),
+  DOCUMENT, {},
+);
+check(Object.getPrototypeOf({}) === Object.prototype, 'a crafted map key does not touch Object.prototype');
+// `'__proto__' in obj` is true for every ordinary object via inheritance, so the
+// question is whether it is an OWN property.
+check(!Object.prototype.hasOwnProperty.call(polluted.layers.agents.byModel, '__proto__'),
+  'a __proto__ key never becomes an own member');
+check(polluted.layers.agents.byModel.sonnet === 3, 'ordinary keys alongside it still pass');
+
+// Recursion follows the schema, not the input, so nesting cannot exhaust the stack.
+let deep = {};
+let cur = deep;
+for (let i = 0; i < 100000; i += 1) { cur.layers = {}; cur = cur.layers; }
+let survived = true;
+try { gate(deep, DOCUMENT, {}); } catch { survived = false; }
+check(survived, 'a 100k-deep input terminates at the declared depth');
+
+const cyclic = { layers: { agents: { status: 'ok', items: [] } } };
+cyclic.self = cyclic;
+let cycOk = true;
+try { gate(cyclic, DOCUMENT, {}); } catch { cycOk = false; }
+check(cycOk, 'a self-referential document does not recurse forever');
+
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

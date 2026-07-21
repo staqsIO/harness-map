@@ -273,9 +273,18 @@ export const DOCUMENT = {
   },
 };
 
+// Keys that mutate an object's prototype rather than adding a member. The map
+// emitters would otherwise have to be trusted never to return one.
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 /**
  * Build the output document from DOCUMENT. Anything not declared is dropped —
  * that is the entire point, so do not add an "unknown keys" passthrough.
+ *
+ * Recursion depth is bounded by the SCHEMA, not by the input: build() only
+ * descends where DOCUMENT declares structure, so a deeply nested or
+ * self-referential input terminates at the declared depth instead of unwinding
+ * the stack.
  */
 export function gate(value, spec = DOCUMENT, { prose = false } = {}) {
   PROSE = prose;
@@ -294,9 +303,12 @@ function build(value, spec) {
     const out = {};
     if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
     for (const [k, v] of Object.entries(value)) {
+      if (UNSAFE_KEYS.has(k)) continue;
       const key = spec.__map.keyEmit(k);
-      if (key == null) continue;
-      out[key] = spec.__map.valEmit(v);
+      if (key == null || UNSAFE_KEYS.has(key)) continue;
+      Object.defineProperty(out, key, {
+        value: spec.__map.valEmit(v), enumerable: true, writable: true, configurable: true,
+      });
     }
     return out;
   }
