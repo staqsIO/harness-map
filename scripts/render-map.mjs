@@ -78,9 +78,12 @@ const num = (v, fallback = 0) => {
 /** Clamp for CSS numeric contexts (width, flex), where even a number needs bounds. */
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, num(v, lo)));
 
-// A layer only counts as present when its items are actually a list: a
-// substituted document can set status:'ok' with items as a string or object.
-const has = (layer) => layer?.status === 'ok' && (layer.items === undefined || Array.isArray(layer.items));
+// Every collection reaching this file comes from a JSON document that may have
+// been hand-edited or substituted, so shape is never assumed. `arr` normalises;
+// `has` gates a whole view. A view that reads `.items` must see a real array —
+// accepting `undefined` here let a later `.some()` throw and produce no page.
+const arr = (v) => (Array.isArray(v) ? v : []);
+const has = (layer) => layer?.status === 'ok' && Array.isArray(layer?.items);
 const statusOf = (layer) => layer?.status ?? 'unconfigured';
 
 /**
@@ -137,7 +140,7 @@ function viewAgents() {
   const declaredTiers = Array.isArray(prose?.tiers) ? prose.tiers : null;
 
   const tierCards = declaredTiers
-    ? `<div class="tier-strip">${declaredTiers.map((t) => `
+    ? `<div class="tier-strip">${arr(declaredTiers).map((t) => `
         <div class="tier-card ${tierClass(t.model)}">
           <span class="tier-name">${esc(t.name)}</span>
           <span class="tier-model">${esc(t.model ?? '—')}</span>
@@ -153,14 +156,14 @@ function viewAgents() {
 
   const warnings = [];
   if (layer.bareInherit?.length) {
-    warnings.push(`<p class="warn"><strong>${num(layer.bareInherit.length)}</strong> agent(s) on bare <code>inherit</code> — they silently bind to the session model: ${layer.bareInherit.map(esc).join(', ')}</p>`);
+    warnings.push(`<p class="warn"><strong>${num(arr(layer.bareInherit).length)}</strong> agent(s) on bare <code>inherit</code> — they silently bind to the session model: ${arr(layer.bareInherit).map(esc).join(', ')}</p>`);
   }
   if (layer.unpinned?.length) {
-    warnings.push(`<p class="warn"><strong>${num(layer.unpinned.length)}</strong> agent(s) with no <code>model:</code> field: ${layer.unpinned.map(esc).join(', ')}</p>`);
+    warnings.push(`<p class="warn"><strong>${num(arr(layer.unpinned).length)}</strong> agent(s) with no <code>model:</code> field: ${arr(layer.unpinned).map(esc).join(', ')}</p>`);
   }
 
-  const showDesc = layer.items.some((a) => a.description);
-  const rows = layer.items.map((a) => `<tr>
+  const showDesc = arr(layer.items).some((a) => a.description);
+  const rows = arr(layer.items).map((a) => `<tr>
       <td class="mono strong">${esc(a.name)}</td>
       <td><span class="chip ${tierClass(a.model)}">${esc(a.model ?? 'unset')}</span></td>
       ${showDesc ? `<td class="desc">${esc(a.description ?? '')}</td>` : ''}
@@ -217,7 +220,7 @@ function viewHooks() {
         ${Object.entries(env).map(([k, v]) => `<tr><td class="mono strong">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join('')}
       </tbody></table></div>` : ''}
       ${compactNote}
-      ${topTools.length ? `<h4>Pre-approved tools</h4><div class="pills">${topTools.map(([t, n]) =>
+      ${topTools.length ? `<h4>Pre-approved tools</h4><div class="pills">${arr(topTools).map(([t, n]) =>
         `<span class="pill"><span class="mono">${esc(t)}</span><span class="pill-n">${num(n)}</span></span>`).join('')}</div>` : ''}
     </section>`;
   }
@@ -273,14 +276,14 @@ function detectedList(layer) {
   const groups = {};
   for (const i of layer.items) (groups[i.kind] ||= []).push(i.name);
   return `<div class="pills">${Object.entries(groups).flatMap(([kind, names]) =>
-    names.map((n) => `<span class="pill"><span class="pill-kind">${esc(kind)}</span><span class="mono">${esc(n)}</span></span>`)
+    arr(names).map((n) => `<span class="pill"><span class="pill-kind">${esc(kind)}</span><span class="mono">${esc(n)}</span></span>`)
   ).join('')}</div>`;
 }
 
 function proseRefs(layer) {
   const refs = layer?.proseRefs ?? [];
   if (!refs.length) return '';
-  return `<p class="note">Interpreted from ${refs.map((r) => `<code>${esc(r.name)}</code>`).join(', ')}.</p>`;
+  return `<p class="note">Interpreted from ${arr(refs).map((r) => `<code>${esc(r.name)}</code>`).join(', ')}.</p>`;
 }
 
 function viewOrchestrators() {
@@ -295,7 +298,7 @@ function viewOrchestrators() {
   const table = rows
     ? `<div class="scroll"><table>
         <thead><tr><th>Orchestrator</th><th>Use when</th><th>Loop type</th></tr></thead>
-        <tbody>${rows.map((r) => `<tr>
+        <tbody>${arr(rows).map((r) => `<tr>
           <td class="mono strong">${esc(r.name)}</td>
           <td class="desc">${esc(r.when ?? '')}</td>
           <td><span class="chip neutral">${esc(r.kind ?? '')}</span></td>
@@ -317,9 +320,9 @@ function viewReview() {
   const table = rows
     ? `<div class="scroll"><table>
         <thead><tr><th>Trigger</th><th>Reviewers</th><th>Why</th></tr></thead>
-        <tbody>${rows.map((r) => `<tr>
+        <tbody>${arr(rows).map((r) => `<tr>
           <td class="desc strong">${esc(r.trigger)}</td>
-          <td>${(r.reviewers ?? []).map((v) => `<span class="chip neutral mono">${esc(v)}</span>`).join(' ')}</td>
+          <td>${arr(r.reviewers).map((v) => `<span class="chip neutral mono">${esc(v)}</span>`).join(' ')}</td>
           <td class="desc dim">${esc(r.note ?? '')}</td>
         </tr>`).join('')}</tbody></table></div>`
     : `<p class="note">Reviewers detected below, but no interpretation was supplied — run the skill to build the escalation table.</p>`;
@@ -338,14 +341,14 @@ function inventoryBlock(title, layer, render) {
 
 function viewInventory() {
   const cmds = inventoryBlock('Commands', L.commands, (l) =>
-    `<div class="pills">${l.items.map((c) => `<span class="pill"><span class="mono">${esc(c.name)}</span></span>`).join('')}</div>`);
+    `<div class="pills">${arr(l.items).map((c) => `<span class="pill"><span class="mono">${esc(c.name)}</span></span>`).join('')}</div>`);
 
   const plugins = inventoryBlock('Plugins', L.plugins, (l) => `
-    ${l.disabled?.length ? `<p class="note"><strong>${num(l.disabled.length)}</strong> installed but disabled: ${l.disabled.map((d) => `<code>${esc(d)}</code>`).join(' ')} — their commands, skills and MCP servers are inert.</p>` : ''}
-    <div class="pills">${l.items.map((p) => `<span class="pill${p.enabled === false ? ' off' : ''}">
+    ${arr(l.disabled).length ? `<p class="note"><strong>${num(arr(l.disabled).length)}</strong> installed but disabled: ${arr(l.disabled).map((d) => `<code>${esc(d)}</code>`).join(' ')} — their commands, skills and MCP servers are inert.</p>` : ''}
+    <div class="pills">${arr(l.items).map((p) => `<span class="pill${p.enabled === false ? ' off' : ''}">
       <span class="mono">${esc(p.name)}</span><span class="pill-kind">${esc(p.marketplace ?? '')}</span></span>`).join('')}</div>
     ${l.marketplaces?.length ? `<h4>Marketplaces</h4><div class="scroll"><table><thead><tr><th>Name</th><th>Type</th><th>Source</th></tr></thead><tbody>
-      ${l.marketplaces.map((m) => `<tr><td class="mono strong">${esc(m.name)}</td><td class="mono dim">${esc(m.type ?? '')}</td><td class="mono">${esc(m.repo ?? '')}</td></tr>`).join('')}
+      ${arr(l.marketplaces).map((m) => `<tr><td class="mono strong">${esc(m.name)}</td><td class="mono dim">${esc(m.type ?? '')}</td><td class="mono">${esc(m.repo ?? '')}</td></tr>`).join('')}
     </tbody></table></div>` : ''}`);
 
   const mcpOrigin = (m) => {
@@ -356,7 +359,7 @@ function viewInventory() {
     ${l.byOrigin ? `<div class="pills">${Object.entries(l.byOrigin).map(([o, n]) =>
       `<span class="pill"><span class="pill-kind">${esc(o)}</span><span class="pill-n">${num(n)}</span></span>`).join('')}</div>` : ''}
     <div class="scroll"><table><thead><tr><th>Server</th><th>Resolved from</th><th>Transport</th><th>State</th></tr></thead><tbody>
-      ${l.items.map((m) => {
+      ${arr(l.items).map((m) => {
         const off = m.active === false;
         return `<tr${off ? ' class="row-off"' : ''}>
           <td class="mono strong">${esc(m.name)}</td>
@@ -370,14 +373,14 @@ function viewInventory() {
     ${l.caveat ? `<p class="note dim">${esc(l.caveat)}</p>` : ''}`);
 
   const rules = inventoryBlock('Rules & instructions', L.rules, (l) =>
-    `<div class="rule-grid">${l.items.map((r) => `<div class="rule-card">
+    `<div class="rule-grid">${arr(l.items).map((r) => `<div class="rule-card">
       <p class="mono strong">${esc(r.name)}</p>
-      <ul class="rule-heads">${(r.headings ?? []).slice(0, 6).map((h) => `<li>${esc(h)}</li>`).join('')}</ul>
+      <ul class="rule-heads">${arr(r.headings).slice(0, 6).map((h) => `<li>${esc(h)}</li>`).join('')}</ul>
     </div>`).join('')}</div>`);
 
   const skills = has(L.skills)
     ? `<section class="block"><h3>Skills <span class="dim mono">${num(L.skills.count)}</span></h3>
-       <p class="note">${esc(L.skills.items.slice(0, 40).map((s) => s.name).join(' · '))}${L.skills.count > 40 ? ` … and ${L.skills.count - 40} more` : ''}</p></section>`
+       <p class="note">${esc(arr(L.skills.items).slice(0, 40).map((s) => s.name).join(' · '))}${L.skills.count > 40 ? ` … and ${L.skills.count - 40} more` : ''}</p></section>`
     : inventoryBlock('Skills', L.skills, () => '');
 
   return cmds + plugins + mcp + rules + skills;
@@ -412,7 +415,7 @@ function viewAudit() {
       ${f.why ? `<p class="finding-why">${esc(f.why)}</p>` : ''}
     </li>`;
 
-  const findings = (audit.findings ?? []).map(finding).join('');
+  const findings = arr(audit.findings).map(finding).join('');
 
   return `<section class="block">
       <h3>Result</h3>
@@ -436,7 +439,7 @@ function viewAudit() {
     ${findings ? `<section class="block"><h3>Findings</h3><ul class="findings">${findings}</ul></section>`
                : `<section class="block"><h3>Findings</h3><p class="note">Every applicable check passes.</p></section>`}
     ${audit.passing?.length ? `<section class="block"><h3>Passing <span class="dim mono">${num(audit.passing.length)}</span></h3>
-      <ul class="passlist">${audit.passing.map((p) => `<li><span class="mono">${esc(p.id)}</span> <span class="dim">${esc(p.detail ?? '')}</span></li>`).join('')}</ul></section>` : ''}`;
+      <ul class="passlist">${arr(audit.passing).map((p) => `<li><span class="mono">${esc(p.id)}</span> <span class="dim">${esc(p.detail ?? '')}</span></li>`).join('')}</ul></section>` : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +706,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:va
       <span>${scan.redacted ? 'redacted' : '⚠ UNREDACTED — contains raw values'}</span>
       <span>${scan.prose ? '⚠ includes authored names — review before sharing' : 'names hidden'}</span>
       <span>schema v${esc(scan.schemaVersion)}</span>
-      ${(scan.sources ?? []).map((s) => `<span>${esc(s.scope)}: ${esc(s.path)}${s.exists ? '' : ' (missing)'}</span>`).join('')}
+      ${arr(scan.sources).map((s) => `<span>${esc(s.scope)}: ${esc(s.path)}${s.exists ? '' : ' (missing)'}</span>`).join('')}
     </div>
   </header>
 

@@ -192,6 +192,90 @@ check "$(j "$TMP/audit-min.json" "d['summary']['notApplicable']>0")" "empty conf
 check "$(j "$TMP/audit-min.json" "all(f['status']!='n/a' for f in d['findings'])")" "n/a checks never appear as findings"
 
 # --- 5. manifests are valid ---------------------------------------------------
+# --- regressions found by cross-model review round 4 -------------------------
+# Every assertion here corresponds to a defect that shipped. Two of them
+# (hooks.defects, the bounded auditor read) had already been "fixed" once and
+# silently regressed, which is why they are pinned by a test rather than a note.
+echo "[review round 4 regressions]"
+
+mkdir -p "$TMP/r4/.claude/agents"
+cat > "$TMP/r4/.claude/settings.json" <<'JSON'
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "echo \"$TOOL_INPUT\" | grep -q rm && exit 1" }] },
+      { "matcher": "CLIENT_ALPHA_INTERNAL",
+        "hooks": [{ "type": "command", "command": "true" }] }
+    ],
+    "CLIENT_CUSTOM_EVENT": [
+      { "matcher": "*", "hooks": [{ "type": "CLIENT_TYPE", "command": "true" }] }
+    ]
+  }
+}
+JSON
+node "$SCAN" --root "$TMP/r4/.claude" > "$TMP/r4.json" 2>/dev/null
+
+check "$(j "$TMP/r4.json" "'defects' in d['layers']['hooks']")" \
+      "scan emits hooks.defects (the two contract checks have data to read)"
+check "$(j "$TMP/r4.json" "len(d['layers']['hooks']['defects']['readsToolInputEnv'])==1")" \
+      "a hook reading \$TOOL_INPUT through a pipe is flagged"
+check "$(j "$TMP/r4.json" "len(d['layers']['hooks']['defects']['nonBlockingExit'])==1")" \
+      "a PreToolUse hook exiting 1 with no exit 2 is flagged"
+check "$(! grep -q 'CLIENT_ALPHA_INTERNAL\|CLIENT_CUSTOM_EVENT\|CLIENT_TYPE' "$TMP/r4.json" && echo true || echo false)" \
+      "authored matcher, event and hook type never reach default output"
+check "$(j "$TMP/r4.json" "any(i['matcher']=='<custom>' for i in d['layers']['hooks']['items'])")" \
+      "an unrecognised matcher collapses to a placeholder"
+check "$(j "$TMP/r4.json" "any(i['matcher']=='Bash' for i in d['layers']['hooks']['items'])")" \
+      "a built-in tool matcher is still emitted verbatim"
+
+# A nested block under a key the scanner does NOT read must leave the document
+# usable. Rejecting these wholesale reported 103 of 132 real skills as having no
+# description, because SKILL.md files routinely carry a `metadata:` block.
+printf -- '---\nname: keeps\nmodel: sonnet\ndescription: still parsed\nmetadata:\n  type: user\n  tags:\n    - a\n---\nbody\n' \
+  > "$TMP/r4/.claude/agents/meta.md"
+node "$SCAN" --root "$TMP/r4/.claude" --include-prose > "$TMP/r4m.json" 2>/dev/null
+check "$(j "$TMP/r4m.json" "any(a['name']=='keeps' and a['model']=='sonnet' and a['description']=='still parsed' for a in d['layers']['agents']['items'])")" \
+      "a nested block under an unread key leaves the scalars intact"
+check "$(j "$TMP/r4m.json" "len(d['layers']['agents'].get('parseWarnings',[]))==0")" \
+      "a nested block under an unread key raises no warning"
+rm -f "$TMP/r4/.claude/agents/meta.md"
+
+printf -- '---\nname: nested\nmodel:\n  family: haiku\ndescription: ok\n---\nbody\n' \
+  > "$TMP/r4/.claude/agents/nested.md"
+node "$SCAN" --root "$TMP/r4/.claude" --include-prose > "$TMP/r4n.json" 2>/dev/null
+check "$(j "$TMP/r4n.json" "len(d['layers']['agents'].get('items',[]))==0")" \
+      "a nested value under model: is withheld, never reported as model:null"
+check "$(j "$TMP/r4n.json" "len(d['layers']['agents'].get('parseWarnings',[]))>0")" \
+      "the withheld key is reported as a parse warning"
+
+head -c 20000000 /dev/zero | tr '\0' 'x' > "$TMP/huge.json" 2>/dev/null
+node "$AUDIT" --scan "$TMP/huge.json" >/dev/null 2>"$TMP/huge.err"
+check "$([ $? -ne 0 ] && grep -qi 'limit\|bytes' "$TMP/huge.err" && echo true || echo false)" \
+      "auditor rejects an oversized --scan file before reading it"
+
+python3 - "$TMP/hostile.json" <<'PYEOF'
+import json,sys
+json.dump({"schemaVersion":2,"prose":False,"sources":"not-a-list","layers":{
+  "agents":{"status":"ok","items":"not-a-list","byModel":{}},
+  "review":{"status":"ok","items":[]},
+  "rules":{"status":"ok","items":[{"name":"r","headings":"nope"}]},
+}}, open(sys.argv[1],"w"))
+PYEOF
+node "$RENDER" --scan "$TMP/hostile.json" \
+  --audit /dev/null --out "$TMP/hostile.html" 2>"$TMP/hostile.err"
+check "$([ -s "$TMP/hostile.html" ] || [ -s "$TMP/hostile.err" ] && echo true || echo false)" \
+      "renderer either renders or fails loudly on wrong collection types, never hangs"
+
+python3 - "$TMP/hostile2.json" <<'PYEOF'
+import json,sys
+json.dump({"schemaVersion":2,"findings":"nope","passing":"nope"}, open(sys.argv[1],"w"))
+PYEOF
+node "$RENDER" --scan "$TMP/r4.json" --audit "$TMP/hostile2.json" \
+  --out "$TMP/hostile2.html" 2>/dev/null
+check "$([ -s "$TMP/hostile2.html" ] && echo true || echo false)" \
+      "renderer survives audit.findings and audit.passing as strings"
+
 echo "[manifests]"
 for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json; do
   python3 -c "import json;json.load(open('$ROOT/$f'))" 2>/dev/null

@@ -16,7 +16,9 @@
  * Usage: node audit-harness.mjs --scan scan.json [--json] [--quiet]
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+
+const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 
 const argv = process.argv.slice(2);
 const arg = (n) => { const i = argv.indexOf(n); return i === -1 ? null : argv[i + 1]; };
@@ -29,7 +31,14 @@ if (!scanPath) {
 }
 
 let scan;
-try { scan = JSON.parse(readFileSync(scanPath, 'utf8')); }
+try {
+  // Bound the read before it happens. Claimed fixed twice while only the
+  // renderer was actually bounded; a 500 MB --scan argument stalled the host.
+  const st = statSync(scanPath);
+  if (!st.isFile()) throw new Error('not a regular file');
+  if (st.size > MAX_INPUT_BYTES) throw new Error(`file is ${st.size} bytes (limit ${MAX_INPUT_BYTES})`);
+  scan = JSON.parse(readFileSync(scanPath, 'utf8'));
+}
 catch (e) { process.stderr.write(`audit: cannot read scan: ${e.message}\n`); process.exit(1); }
 
 const L = scan.layers ?? {};

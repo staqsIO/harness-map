@@ -187,6 +187,38 @@ const SAFE_ENV_VALUES = new Set([
   'DISABLE_TELEMETRY',
   'DISABLE_COST_WARNINGS',
 ]);
+// Hook event names, matchers and types come from the user's settings.json, so
+// they are authored text rather than a closed enumeration. A matcher in
+// particular is a free-form pattern. Emit the recognised vocabulary verbatim and
+// collapse anything else to a placeholder, so the default document cannot carry
+// a string the user wrote.
+const CUSTOM = '<custom>';
+const KNOWN_EVENTS = new Set([
+  'PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'SubagentStop',
+  'UserPromptSubmit', 'SessionStart', 'SessionEnd', 'PreCompact', 'PostCompact',
+]);
+const KNOWN_HOOK_TYPES = new Set(['command', 'prompt']);
+// Built-in tool names only. A matcher may alternate them with `|`; anything else
+// (a custom regex, an MCP tool name, a plugin tool) is authored text.
+const KNOWN_TOOLS = new Set([
+  'Agent', 'Task', 'Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'WebFetch',
+  'WebSearch', 'NotebookEdit', 'TodoWrite', 'ExitPlanMode', 'Artifact',
+  'SlashCommand', 'KillShell', 'BashOutput', '*',
+]);
+function enumOr(value, allowed, placeholder) {
+  const v = String(value ?? '');
+  return allowed.has(v) ? v : placeholder;
+}
+function matcherLabel(raw) {
+  if (raw === '' || raw == null) return '(all)';
+  const v = String(raw);
+  if (!REDACT) return ident(v, 60);
+  // `manual|auto` on PreCompact and similar non-tool matchers are covered by the
+  // tool list where they overlap; everything else is opaque.
+  const parts = v.split('|');
+  if (parts.length <= 8 && parts.every((t) => KNOWN_TOOLS.has(t))) return v;
+  return CUSTOM;
+}
 function envValue(key, value) {
   if (!REDACT) return String(value);
   if (!SAFE_ENV_VALUES.has(key)) return HIDDEN;
@@ -254,6 +286,7 @@ function parseFrontmatter(text) {
   if (!m) return null;
 
   const fm = {};
+  const nonScalar = new Set();
   const lines = m[1].split(/\r?\n/);
   // ALL-OR-NOTHING: any construct outside the supported subset rejects the whole
   // block. Returning a partially-guessed object is how a wrong `model:` or a
@@ -267,13 +300,43 @@ function parseFrontmatter(text) {
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     if (!rawLine.trim() || rawLine.trimStart().startsWith('#')) continue;
-    if (/^\s/.test(rawLine) || rawLine.trimStart().startsWith('-')) continue;
+    // An indented line or a sequence entry at this point belongs to a nested
+    // structure. This parser reads scalars only, so it does not try to represent
+    // one — but it must not pretend the key was empty either: skipping the body
+    // of `model:\n  family: haiku` yielded `model: null`, which the audit then
+    // read as a real value ("no model pinned"). Instead the key is recorded as
+    // NON-SCALAR and its body consumed. Callers that need the key as a scalar
+    // treat it as unparsed; callers that ignore the key are unaffected, which is
+    // what keeps a `metadata:` block from invalidating a whole SKILL.md.
+    if (/^\s/.test(rawLine) || rawLine.trimStart().startsWith('-')) {
+      return reject('indented line outside a nested value');
+    }
     const kv = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (!kv) continue;
+    if (!kv) return reject('unparseable line');
     const key = kv[1];
     let value = kv[2];
 
     if (Object.prototype.hasOwnProperty.call(fm, key)) return reject(`duplicate key '${key}'`);
+
+    // `key:` with nothing after it, followed by an indented block or a sequence,
+    // is a nested value. Consume the body, mark the key non-scalar, move on.
+    if (value.trim() === '') {
+      const body = [];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (next.trim() === '') { body.push(next); i++; continue; }
+        if (!/^\s/.test(next) && !next.trimStart().startsWith('-')) break;
+        body.push(next); i++;
+      }
+      if (body.some((l) => l.trim() !== '')) {
+        nonScalar.add(key);
+        fm[key] = null;
+        continue;
+      }
+      // genuinely an empty scalar
+      fm[key] = null;
+      continue;
+    }
 
     const blockHeader = value.trim().match(/^([>|])([0-9]*)([-+]?)(\s+#.*)?$/);
     if (blockHeader) {
@@ -333,6 +396,9 @@ function parseFrontmatter(text) {
     if (/^(null|Null|NULL|~)$/.test(value)) { fm[key] = null; continue; }
     fm[key] = value;
   }
+  if (nonScalar.size) {
+    Object.defineProperty(fm, '__nonScalar', { value: nonScalar, enumerable: false });
+  }
   return fm;
 }
 
@@ -341,7 +407,7 @@ function frontmatterOf(file) {
   const fm = parseFrontmatter(readTextBounded(file));
   if (!fm) return { fm: null, warning: null };
   if (fm.__rejected) return { fm: null, warning: fm.__rejected };
-  return { fm, warning: null };
+  return { fm, warning: null, nonScalar: fm.__nonScalar ?? new Set() };
 }
 
 // ---------------------------------------------------------------------------
@@ -381,9 +447,15 @@ function scanAgents(roots) {
     const agentsDir = join(dir, 'agents');
     if (!isDir(agentsDir)) continue;
     for (const file of walk(agentsDir, '.md', 2)) {
-      const { fm, warning } = frontmatterOf(file);
+      const { fm, warning, nonScalar } = frontmatterOf(file);
       if (warning) { parseWarnings.push({ file: pathOf(file), warnings: [warning] }); continue; }
       if (!fm) continue;
+      // A nested `metadata:` block is irrelevant here; a nested `model:` is not.
+      const bad = ['name', 'model', 'description', 'tools'].filter((k) => nonScalar?.has(k));
+      if (bad.length) {
+        parseWarnings.push({ file: pathOf(file), warnings: [`non-scalar value for ${bad.join(', ')}`] });
+        continue;
+      }
       items.push({
         name: ident(fm.name || basename(file, '.md')),
         model: fm.model ? ident(fm.model, 40) : null,
@@ -395,7 +467,15 @@ function scanAgents(roots) {
       });
     }
   }
-  if (!items.length) return unconfigured('no agents/*.md with frontmatter found');
+  if (!items.length) {
+    // Distinguish "no agents" from "agents exist but none parsed". Collapsing
+    // both to unconfigured reported a clean empty state for a directory whose
+    // every file was rejected, and dropped the warnings that said why.
+    if (parseWarnings.length) {
+      return { status: 'ok', count: 0, items: [], byModel: {}, bareInherit: [], unpinned: [], parseWarnings };
+    }
+    return unconfigured('no agents/*.md with frontmatter found');
+  }
 
   const byModel = {};
   for (const a of items) byModel[a.model || '(unset)'] = (byModel[a.model || '(unset)'] || 0) + 1;
@@ -417,9 +497,9 @@ function scanHooks(settingsFiles) {
       for (const entry of entries) {
         for (const def of Array.isArray(entry?.hooks) ? entry.hooks : []) {
           items.push({
-            event: ident(event, 40),
-            matcher: entry?.matcher === '' || entry?.matcher == null ? '(all)' : ident(entry.matcher, 60),
-            type: ident(def?.type, 20),
+            event: REDACT ? enumOr(event, KNOWN_EVENTS, CUSTOM) : ident(event, 40),
+            matcher: matcherLabel(entry?.matcher),
+            type: REDACT ? enumOr(def?.type, KNOWN_HOOK_TYPES, CUSTOM) : ident(def?.type, 20),
             timeout: typeof def?.timeout === 'number' ? def.timeout : null,
             command: describeCommand(def?.command),
             scope,
@@ -450,10 +530,52 @@ function scanHooks(settingsFiles) {
     }
   }
 
+  // Two TEXT-LEVEL defect detectors. Each searches a hook's command (and the
+  // script it references) for one specific mistake that makes the hook unable to
+  // do its job. They prove nothing about runtime behaviour — see the README
+  // section on what this tool does not check — but each one found real dead
+  // hooks in a live config. The command text is read here and never emitted.
+  //
+  // 1. $TOOL_INPUT — Claude Code delivers hook data as JSON on STDIN. No such
+  //    environment variable is set, so a hook reading it inspects an empty
+  //    string and never matches.
+  // 2. exit 1 — only exit 2 blocks a PreToolUse call. Exit 1 is a NON-blocking
+  //    error: it is logged and the tool call proceeds.
+  const defects = { readsToolInputEnv: [], nonBlockingExit: [] };
+  const inspect = (event, matcher, command, scriptPath) => {
+    const label = scriptPath
+      ? ident(basename(scriptPath), 60)
+      : `${REDACT ? enumOr(event, KNOWN_EVENTS, CUSTOM) : event}[${matcherLabel(matcher)}] inline`;
+    let text = command;
+    if (scriptPath && existsSync(scriptPath)) text += '\n' + (readTextBounded(scriptPath) ?? '');
+    const usesEnv = /\$\{?TOOL_INPUT|\$\{?CLAUDE_TOOL_INPUT/.test(text);
+    // `echo "$TOOL_INPUT" | python3 -c '...sys.stdin...'` does read stdin, but the
+    // stdin it reads is a pipe carrying an empty variable, not the hook event.
+    // Counting that as a stdin fallback masked two genuinely dead guards.
+    const pipesEnv = /(?:echo|printf|cat)[^|\n]*\$\{?(?:CLAUDE_)?TOOL_INPUT[^|\n]*\|/.test(text);
+    const readsStdin = /\bcat\b|sys\.stdin|process\.stdin|read -r|readFileSync\(0|\/dev\/stdin/.test(text);
+    if (usesEnv && (pipesEnv || !readsStdin)) defects.readsToolInputEnv.push(label);
+    if (event === 'PreToolUse' && /\bexit\s+1\b/.test(text) && !/\bexit\s+2\b/.test(text)) {
+      defects.nonBlockingExit.push(label);
+    }
+  };
+  for (const { data } of settingsFiles) {
+    for (const [event, entries] of Object.entries(data?.hooks ?? {})) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries) for (const h of Array.isArray(e?.hooks) ? e.hooks : []) {
+        if (!h?.command) continue;
+        const cmd = String(h.command);
+        const script = cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/)?.[0] ?? null;
+        inspect(event, e?.matcher, cmd, script);
+      }
+    }
+  }
+
   return ok(items, {
     byEvent,
     events: Object.keys(byEvent).sort(),
     scriptRefs,
+    defects,
     missingTimeout: items.filter((h) => h.timeout == null).length,
   });
 }
@@ -488,8 +610,12 @@ function scanSkills(roots) {
     for (const entry of listDir(skillsDir)) {
       const skillFile = join(skillsDir, entry, 'SKILL.md');
       if (!existsSync(skillFile)) continue;
-      const { fm: parsed, warning } = frontmatterOf(skillFile);
+      const { fm: parsed, warning, nonScalar } = frontmatterOf(skillFile);
       if (warning) parseWarnings.push({ file: pathOf(skillFile), warnings: [warning] });
+      const badKeys = ['name', 'description'].filter((k) => nonScalar?.has(k));
+      if (badKeys.length) {
+        parseWarnings.push({ file: pathOf(skillFile), warnings: [`non-scalar value for ${badKeys.join(', ')}`] });
+      }
       const fm = parsed || {};
       items.push({
         name: ident(fm.name || entry),
