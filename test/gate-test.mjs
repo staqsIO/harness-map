@@ -125,5 +125,48 @@ let cycOk = true;
 try { gate(cyclic, DOCUMENT, {}); } catch { cycOk = false; }
 check(cycOk, 'a self-referential document does not recurse forever');
 
+// --- emitter tightness (review round 7) ------------------------------------
+// The architecture held — one write path, undeclared fields dropped — but three
+// emitters were individually loose enough to pass authored text through a
+// DECLARED position. An emitter must carry its own guarantee and never rely on
+// the scanner having already collapsed the value.
+const em = (doc) => gate(doc, DOCUMENT, { prose: false });
+
+check(em({ layers: { environment: { status: 'ok', model: 'claudeAcmeSecret' } } })
+  .layers.environment.model === '<custom>',
+  'a claude-prefixed non-model-id does not pass modelName');
+check(em({ layers: { environment: { status: 'ok', model: 'claude-opus-4-8[1m]' } } })
+  .layers.environment.model === 'claude-opus-4-8[1m]',
+  'a real published model id still passes');
+check(em({ layers: { hooks: { status: 'ok', items: [{ matcher: 'AcmeInternalTool' }] } } })
+  .layers.hooks.items[0].matcher === '<custom>',
+  'the gate rejects an unknown matcher even if the scanner did not');
+check(em({ layers: { hooks: { status: 'ok', items: [{ matcher: 'Write|Edit' }] } } })
+  .layers.hooks.items[0].matcher === 'Write|Edit',
+  'an alternation of built-in tool names still passes');
+check(em({ layers: { agents: { status: 'ok', reason: "duplicate key 'AcmeSecret'" } } })
+  .layers.agents.reason === null,
+  'a generated message that quotes an authored key is withheld');
+
+// CLAUDE.md is a filename Claude Code defines, and the audit matches on it by
+// name — collapsing it made the audit report that no CLAUDE.md existed.
+check(em({ layers: { rules: { status: 'ok', items: [{ name: 'CLAUDE.md' }] } } })
+  .layers.rules.items[0].name === 'CLAUDE.md',
+  'a published filename survives so consumers can match on it');
+check(em({ layers: { plugins: { status: 'ok', marketplaces: [{ name: 'marketplace-01' }] } } })
+  .layers.plugins.marketplaces[0].name === 'marketplace-01',
+  'the tool\'s own generated marketplace label is accepted');
+
+// --- cardinality and inherited properties -----------------------------------
+const wide = em({
+  layers: { agents: { status: 'ok', items: Array.from({ length: 9000 }, () => ({ name: 'agent-01' })) } },
+});
+check(wide.layers.agents.items.length === 5000, 'a list is capped rather than mirroring input width');
+
+const inherited = Object.create({ schemaVersion: 99 });
+inherited.prose = false;
+check(em(inherited).schemaVersion === undefined,
+  'a declared field inherited from the input prototype is not accepted');
+
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

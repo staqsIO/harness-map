@@ -38,11 +38,19 @@ const INTERPRETATIONS = new Set(['required', 'optional', 'none']);
 
 // Placeholders this tool generates. Nothing else may occupy a label position.
 const PLACEHOLDERS = new Set([
-  CUSTOM, HIDDEN, '<file>', '<script>', '<plugin>', '<detected>', '<external path>',
-  '(all)', '(mcp tools)', '(unset)', '(unrecognized)', '(other)',
+  CUSTOM, HIDDEN, '<file>', '<script>', '<plugin>', '<marketplace>', '<detected>',
+  '<external path>', '(all)', '(mcp tools)', '(unset)', '(unrecognized)', '(other)',
 ]);
 // agent-01, skill-12, mcp-03, plugin-01, rule-02, script-05, env-04
-const GENERATED_LABEL = /^(?:agent|skill|command|mcp|plugin|rule|script|env)-\d{1,4}$/;
+const GENERATED_LABEL = /^(?:agent|skill|command|mcp|plugin|marketplace|rule|script|env)-\d{1,4}$/;
+// Filenames Claude Code itself defines. These are not authored by the user, and
+// consumers match on them: the audit's CLAUDE.md check compares by name, so
+// collapsing this to a placeholder made it report "no CLAUDE.md found" on a
+// config that has one.
+const PUBLISHED_NAMES = new Set([
+  'CLAUDE.md', 'CLAUDE.local.md', 'agent-routing', 'safety', 'verifier-protocol',
+  'context-hygiene', 'git-conventions',
+]);
 // `user:agents/foo.md` — a scope prefix plus a path relative to a scanned root.
 const RELATIVE_PATH = /^(?:user|project|local|plugin):[\w.\-/@ ]{0,120}$/;
 
@@ -85,7 +93,7 @@ const label = (v) => {
   if (v == null) return null;
   const s = String(v);
   if (PROSE) return s;
-  return GENERATED_LABEL.test(s) || PLACEHOLDERS.has(s) ? s : CUSTOM;
+  return GENERATED_LABEL.test(s) || PLACEHOLDERS.has(s) || PUBLISHED_NAMES.has(s) ? s : CUSTOM;
 };
 /** A path relative to a scanned root. Never absolute, never outside the tree. */
 const path = (v) => {
@@ -102,21 +110,27 @@ const modelName = (v) => {
   if (v == null) return null;
   const s = String(v);
   if (PROSE) return s;
+  // A published model id is dashed and lowercase (claude-opus-4-8, optionally
+  // with a [1m] context suffix). `claudeAcmeSecret` is not a model id, and the
+  // previous `claude` prefix test passed it verbatim.
   return /^(?:opus|sonnet|haiku|fable|inherit|opusplan|default)$/.test(s)
-    || /^claude[\w.[\]-]{0,48}$/i.test(s)
+    || /^claude-[a-z0-9]+(?:[-.][a-z0-9]+)*(?:\[[a-z0-9]{1,6}\])?$/i.test(s)
     || PLACEHOLDERS.has(s)
     ? s
     : CUSTOM;
 };
-/** A hook matcher: built-in tool names, optionally alternated. */
+/**
+ * A hook matcher: built-in tool names, optionally alternated with `|`.
+ * The scanner already collapses unknown matchers, but the gate must not depend on
+ * that — an emitter that accepts any identifier provides no guarantee on its own.
+ */
 const matcher = (v) => {
   if (v == null) return null;
   const s = String(v);
   if (PROSE) return s;
   if (PLACEHOLDERS.has(s)) return s;
-  return /^[A-Za-z][A-Za-z0-9_]{0,30}(?:\|[A-Za-z][A-Za-z0-9_]{0,30}){0,7}$/.test(s) || s === '*'
-    ? s
-    : CUSTOM;
+  const parts = s.split('|');
+  return parts.length <= 8 && parts.every((t) => TOOLS.has(t)) ? s : CUSTOM;
 };
 /** An environment VALUE: only a number or a boolean survives. */
 const envValue = (v) => {
@@ -129,10 +143,15 @@ const envValue = (v) => {
 const note = (v) => {
   if (v == null) return null;
   const s = String(v);
+  // --include-prose is the mode where authored text is allowed through; a warning
+  // that names the offending key is exactly the detail it exists to provide.
+  if (PROSE) return s;
   if (KNOWN_NOTES.has(s)) return s;
-  // Reason/warning strings are generated here, so they may only contain the
-  // vocabulary this tool writes: letters, digits and light punctuation.
-  return /^[A-Za-z0-9 ,.;:()/'\-<>$]{0,200}$/.test(s) ? s : null;
+  // Generated messages quote the offending key ("duplicate key 'Acme-Secret'"),
+  // and that key is authored. A quoted segment is therefore never allowed here,
+  // whatever produced it — the message carries the reason, not the identifier.
+  if (/['"`]/.test(s)) return null;
+  return /^[A-Za-z0-9 ,.;:()/\-<>$]{0,200}$/.test(s) ? s : null;
 };
 
 /** A key drawn from published Claude Code vocabulary, else an opaque label. */
@@ -151,7 +170,12 @@ const arrayOf = (spec) => ({ __array: spec });
 const mapOf = (keyEmit, valEmit) => ({ __map: { keyEmit, valEmit } });
 
 // --- the declared document -------------------------------------------------
-const COMMAND_SHAPE = { type: enumOf(COMMAND_TYPES), length: num };
+// The renderer's cmdLabel() reads exe, script and raw. exe/script are basenames
+// (authored, so text()); raw is the full command and exists only under
+// --include-values, which already disables redaction.
+const COMMAND_SHAPE = {
+  type: enumOf(COMMAND_TYPES), length: num, exe: text, script: text, raw: text,
+};
 const PROSE_REF = { name: label, file: path, headings: arrayOf(text) };
 const PARSE_WARNING = { file: path, warnings: arrayOf(note) };
 const DETECTED_ITEM = { kind: oneOf(KINDS), name: label };
@@ -276,6 +300,9 @@ export const DOCUMENT = {
 // Keys that mutate an object's prototype rather than adding a member. The map
 // emitters would otherwise have to be trusted never to return one.
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+// Arrays and maps are otherwise unbounded: output width follows input width, so a
+// configuration with 10^6 entries produces a document of that size.
+const MAX_ITEMS = 5000;
 
 /**
  * Build the output document from DOCUMENT. Anything not declared is dropped —
@@ -297,13 +324,17 @@ function build(value, spec) {
     if (!Array.isArray(value)) return [];
     return value
       .filter((v) => v !== null && v !== undefined)
+      .slice(0, MAX_ITEMS)
       .map((v) => build(v, spec.__array));
   }
   if (spec && spec.__map) {
     const out = {};
     if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+    let n = 0;
     for (const [k, v] of Object.entries(value)) {
       if (UNSAFE_KEYS.has(k)) continue;
+      if (n >= MAX_ITEMS) break;
+      n += 1;
       const key = spec.__map.keyEmit(k);
       if (key == null || UNSAFE_KEYS.has(key)) continue;
       Object.defineProperty(out, key, {
@@ -316,7 +347,9 @@ function build(value, spec) {
     if (value == null || typeof value !== 'object' || Array.isArray(value)) return null;
     const out = {};
     for (const [k, sub] of Object.entries(spec)) {
-      if (!(k in value)) continue;
+      // hasOwnProperty, not `in`: `in` would accept a declared field inherited
+      // from a polluted input prototype.
+      if (!Object.prototype.hasOwnProperty.call(value, k)) continue;
       const built = build(value[k], sub);
       if (built !== undefined) out[k] = built;
     }

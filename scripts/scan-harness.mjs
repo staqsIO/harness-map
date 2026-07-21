@@ -1090,7 +1090,14 @@ function applyProsePolicy(doc, includeProse) {
   }
   // A parse-warning message quotes the offending KEY, which is authored text:
   // `anchor/alias/tag unsupported ('CLIENT_SECRET')`. Keep the reason, drop the key.
-  const stripKey = (w) => String(w).replace(/\s*\('[^']*'\)/g, '').replace(/ for [\w, -]+$/, '');
+  // Warning text is generated here but quotes the offending KEY, which the user
+  // authored: "anchor/alias/tag unsupported ('X')", "duplicate key 'X'",
+  // "non-scalar value for X". Strip every form; the reason is what matters.
+  const stripKey = (w) => String(w)
+    .replace(/\s*\('[^']*'\)/g, '')
+    .replace(/\s*'[^']*'/g, '')
+    .replace(/ for [\w, -]+$/, '')
+    .trim();
   for (const lyr of [L.agents, L.skills]) {
     if (lyr?.parseWarnings) {
       lyr.parseWarnings = lyr.parseWarnings.map((w) => ({
