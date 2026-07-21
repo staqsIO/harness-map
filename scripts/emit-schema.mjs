@@ -87,7 +87,22 @@ const ENV_KEYS = new Set([
 // warnings are GENERATED here, so the set is finite and can be listed — which is
 // stronger than any character-class test. A charset check passed 200 characters of
 // authored text, and node:fs error messages embed the absolute path that failed.
-const LAYERS = ['agents', 'hooks', 'environment', 'commands', 'skills', 'plugins', 'mcp', 'rules'];
+// Every label passed to layer() in scan-harness.mjs. Omitting the two derived
+// layers meant `failed to scan orchestrators (EACCES)` was withheld — losing the
+// explanation exactly on the error path. test/notes-test.mjs now derives this
+// list from the source so the two cannot drift again.
+const LAYERS = [
+  'agents', 'hooks', 'environment', 'commands', 'skills', 'plugins', 'mcp',
+  'rules', 'orchestrators', 'review',
+];
+// A real errno, not any uppercase word: `failed to scan agents (ACME_SECRET)`
+// passed the previous [A-Z_]{1,20} form. Not user-reachable today, but an emitter
+// must hold on its own rather than trusting its caller.
+const ERRNOS = [
+  'EACCES', 'ENOENT', 'EPERM', 'EISDIR', 'ENOTDIR', 'EMFILE', 'ENFILE', 'ELOOP',
+  'ENAMETOOLONG', 'EBADF', 'EINVAL', 'ENOMEM', 'EEXIST', 'EROFS', 'EAGAIN',
+  'EBUSY', 'ENOSPC', 'EIO', 'ETIMEDOUT', 'unknown error',
+];
 const KNOWN_NOTES = new Set([
   'harness-map',
   'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned'
@@ -116,7 +131,9 @@ const KNOWN_NOTES = new Set([
   'non-scalar value',
 ]);
 // `failed to scan <layer> (<CODE>)` — the layer is ours, the code is an fs errno.
-const SCAN_ERROR = new RegExp(`^failed to scan (?:${LAYERS.join('|')}) \\([A-Z_]{1,20}|unknown error\\)$`);
+const SCAN_ERROR = new RegExp(
+  `^failed to scan (?:${LAYERS.join('|')}) \\((?:${ERRNOS.join('|')})\\)$`,
+);
 
 // --- emitters --------------------------------------------------------------
 // Each returns a value of a shape that cannot carry free-form text, EXCEPT text(),
@@ -154,10 +171,15 @@ const modelName = (v) => {
   // A published model id is dashed and lowercase (claude-opus-4-8, optionally
   // with a [1m] context suffix). `claudeAcmeSecret` is not a model id, and the
   // previous `claude` prefix test passed it verbatim.
-  // Published ids are lowercase and short. The case-insensitive, unbounded form
-  // accepted CLAUDE-ACME-SECRET and arbitrarily long claude- payloads.
+  // A `claude-` prefix is not enough: `claude-acme-secret-prod` satisfied it.
+  // A published id names a FAMILY (claude-opus-4-8) or opens with a generation
+  // number (claude-3-5-sonnet-20241022); everything after that is digits, dots
+  // and dashes. Anthropic also supports arbitrary custom gateway model names, and
+  // those necessarily collapse here — preserving an arbitrary authored name and
+  // guaranteeing no authored text are mutually exclusive, so the guarantee wins.
   return /^(?:opus|sonnet|haiku|fable|inherit|opusplan|default)$/.test(s)
-    || (s.length <= 40 && /^claude-[a-z0-9]+(?:[-.][a-z0-9]+){0,6}(?:\[[a-z0-9]{1,6}\])?$/.test(s))
+    || (s.length <= 40
+      && /^claude-(?:(?:opus|sonnet|haiku|fable|instant)|\d+)[\d.-]*(?:-(?:opus|sonnet|haiku|fable|instant))?[\d.-]*(?:\[[a-z0-9]{1,6}\])?$/.test(s))
     || PLACEHOLDERS.has(s)
     ? s
     : CUSTOM;

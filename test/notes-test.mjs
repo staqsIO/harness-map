@@ -63,5 +63,26 @@ check(accepted('failed to scan mcp (unknown error)'), 'a scan error with no errn
 check(!accepted('failed to scan agents: ENOENT: open /Users/me/x'),
   'a scan error carrying a filesystem path is still withheld');
 
+// --- scan-error reasons cover every layer() label -------------------------
+// The derived layers (orchestrators, review) go through layer() like the rest,
+// but were missing from the gate's LAYERS list, so their error reason was
+// withheld — losing the explanation exactly on the error path. Fixtures cannot
+// catch this because none of them makes a derived layer throw, so the list is
+// derived from the source instead.
+// Extracted from the layer() call sites themselves, with no hardcoded list — a
+// hardcoded filter here would exclude a NEW layer, which is exactly the case this
+// test exists to catch.
+const layerNames = [...new Set(
+  [...src.matchAll(/\blayer\(\s*\(\)\s*=>[\s\S]*?,\s*'([A-Za-z]+)'\s*\)/g)].map((m) => m[1]),
+)];
+check(layerNames.length >= 10,
+  `found ${layerNames.length} layer() labels in the scanner: ${layerNames.join(', ')}`);
+const uncovered = layerNames.filter((l) => !accepted(`failed to scan ${l} (EACCES)`));
+check(uncovered.length === 0, 'a scan error is accepted for every layer');
+for (const u of uncovered) console.log(`        no scan-error reason for layer: ${u}`);
+
+check(!accepted('failed to scan agents (ACME_SECRET)'),
+  'a scan error whose code is not a real errno is withheld');
+
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

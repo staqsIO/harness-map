@@ -186,6 +186,17 @@ check(em({ layers: { agents: { status: 'ok', items: [{ file: 'user:settings.json
 check(em({ layers: { environment: { status: 'ok', model: 'CLAUDE-ACME-SECRET' } } })
   .layers.environment.model === '<custom>',
   'an uppercase claude-prefixed string is not treated as a model id');
+// The uppercase case above passed while the LOWERCASE one leaked — the test was
+// checking the variant that was already handled. A published id names a family
+// or opens with a generation number; `claude-acme-...` does neither.
+check(em({ layers: { environment: { status: 'ok', model: 'claude-acme-secret-prod' } } })
+  .layers.environment.model === '<custom>',
+  'a lowercase dashed claude- string that names no known family is withheld');
+for (const id of ['claude-opus-4-8', 'claude-opus-4-8[1m]', 'claude-3-5-sonnet-20241022',
+  'claude-sonnet-5', 'claude-haiku-4-5-20251001']) {
+  check(em({ layers: { environment: { status: 'ok', model: id } } })
+    .layers.environment.model === id, `published model id survives: ${id}`);
+}
 check(em({ layers: { agents: { status: 'ok', reason: 'ACME internal note about a customer' } } })
   .layers.agents.reason === null,
   'note is a closed set: arbitrary quote-free prose does not pass');
