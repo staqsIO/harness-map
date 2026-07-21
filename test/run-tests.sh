@@ -249,6 +249,61 @@ check "$(j "$TMP/r4n.json" "len(d['layers']['agents'].get('items',[]))==0")" \
 check "$(j "$TMP/r4n.json" "len(d['layers']['agents'].get('parseWarnings',[]))>0")" \
       "the withheld key is reported as a parse warning"
 
+# --- round 5: every field that reached default output as authored text --------
+# Each name below survived the "structure only" default in review round 5. The
+# leak was never a pattern-matching miss — it was fields assumed to be closed
+# enumerations that are in fact free text the user typed.
+mkdir -p "$TMP/r5/.claude/agents"
+cat > "$TMP/r5/.claude/settings.json" <<'JSON'
+{
+  "model": "CLIENT_MODEL_SECRET",
+  "env": { "DISABLE_TELEMETRY": "CLIENT_ENV_SECRET" },
+  "statusLine": { "type": "CLIENT_STATUS_SECRET", "command": "true" },
+  "permissions": { "defaultMode": "CLIENT_MODE_SECRET" },
+  "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command",
+    "command": "/tmp/CLIENT_HOOK_SECRET.sh; echo \"$TOOL_INPUT\"" }] }] },
+  "mcpServers": { "server": { "type": "CLIENT_TRANSPORT_SECRET" } }
+}
+JSON
+printf -- '---\nname: a\nmodel: # CUSTOMER_SECRET\n---\nx\n' > "$TMP/r5/.claude/agents/a.md"
+node "$SCAN" --root "$TMP/r5/.claude" > "$TMP/r5.json" 2>/dev/null
+
+check "$(! grep -qE 'CLIENT_[A-Z_]+|CUSTOMER_SECRET' "$TMP/r5.json" && echo true || echo false)" \
+      "no authored model, env value, statusLine type, permission mode, transport or script name survives"
+check "$(j "$TMP/r5.json" "d['layers']['hooks']['defects']['readsToolInputEnv']==['script-01']")" \
+      "a defect label refers to a script by index, never by its authored basename"
+check "$(j "$TMP/r5.json" "d['layers']['environment']['env']['DISABLE_TELEMETRY']=='<hidden>'")" \
+      "an allowlisted env key still hides a value outside its numeric/boolean domain"
+
+printf -- '---\nname: n\nmodel: 475000\n---\nx\n' > "$TMP/r5/.claude/agents/a.md"
+node "$SCAN" --root "$TMP/r5/.claude" --include-prose > "$TMP/r5v.json" 2>/dev/null
+check "$(j "$TMP/r5v.json" "all(a['model']!='# CUSTOMER_SECRET' for a in d['layers']['agents']['items'])")" \
+      "a comment-only value parses as empty, not as the comment text"
+
+# `-foo: v` at column 0 is a top-level KEY in YAML: the dash has no space after it.
+printf -- '---\nname: dash\nmetadata:\n-foo: kept\nmodel: sonnet\n---\nx\n' > "$TMP/r5/.claude/agents/a.md"
+node "$SCAN" --root "$TMP/r5/.claude" --include-prose > "$TMP/r5d.json" 2>/dev/null
+check "$(j "$TMP/r5d.json" "len(d['layers']['agents'].get('parseWarnings',[]))>0 or all(a.get('model')=='sonnet' for a in d['layers']['agents']['items'])")" \
+      "a dash-prefixed top-level key is not swallowed into the preceding nested block"
+
+python3 - "$TMP/hostile3.json" <<'PYEOF'
+import json,sys
+json.dump({"schemaVersion":2,"layers":{"mcp":{"status":"ok","count":1,
+  "items":[{"name":"m","origin":"user","shadowed":"not-a-list"}]}}}, open(sys.argv[1],"w"))
+PYEOF
+node "$RENDER" --scan "$TMP/hostile3.json" --out "$TMP/hostile3.html" 2>/dev/null
+check "$([ -s "$TMP/hostile3.html" ] && echo true || echo false)" \
+      "renderer survives mcp shadowed as a string"
+
+python3 - "$TMP/hostile4.json" <<'PYEOF'
+import json,sys
+json.dump({"findings":[{"id":"x","severity":"high","title":"t","detail":"d",
+  "evidence":"not-a-list"}],"passing":[]}, open(sys.argv[1],"w"))
+PYEOF
+node "$RENDER" --scan "$TMP/r5.json" --audit "$TMP/hostile4.json" --out "$TMP/hostile4.html" 2>/dev/null
+check "$([ -s "$TMP/hostile4.html" ] && echo true || echo false)" \
+      "renderer survives a finding whose evidence is a string"
+
 head -c 20000000 /dev/zero | tr '\0' 'x' > "$TMP/huge.json" 2>/dev/null
 node "$AUDIT" --scan "$TMP/huge.json" >/dev/null 2>"$TMP/huge.err"
 check "$([ $? -ne 0 ] && grep -qi 'limit\|bytes' "$TMP/huge.err" && echo true || echo false)" \

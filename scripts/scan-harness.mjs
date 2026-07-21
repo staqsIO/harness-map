@@ -198,6 +198,21 @@ const KNOWN_EVENTS = new Set([
   'UserPromptSubmit', 'SessionStart', 'SessionEnd', 'PreCompact', 'PostCompact',
 ]);
 const KNOWN_HOOK_TYPES = new Set(['command', 'prompt']);
+// Anthropic-published values, not text the user invented. Anything else is
+// authored and collapses. `model` also accepts a published model id.
+const KNOWN_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable', 'inherit', 'opusplan', 'default']);
+const KNOWN_TRANSPORTS = new Set(['stdio', 'sse', 'http', 'https', 'ws', 'wss', 'sse-http']);
+const KNOWN_STATUSLINE_TYPES = new Set(['command', 'static']);
+const KNOWN_PERMISSION_MODES = new Set([
+  'default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto',
+]);
+function modelLabel(raw) {
+  if (raw == null) return null;
+  const v = String(raw);
+  if (!REDACT) return ident(v, 60);
+  if (KNOWN_MODEL_ALIASES.has(v)) return v;
+  return /^claude[\w.[\]-]{0,48}$/i.test(v) ? v : CUSTOM;
+}
 // Built-in tool names only. A matcher may alternate them with `|`; anything else
 // (a custom regex, an MCP tool name, a plugin tool) is authored text.
 const KNOWN_TOOLS = new Set([
@@ -223,8 +238,10 @@ function envValue(key, value) {
   if (!REDACT) return String(value);
   if (!SAFE_ENV_VALUES.has(key)) return HIDDEN;
   const v = String(value);
-  // Even allowlisted keys only pass through if the value is a simple scalar.
-  return /^[\w.-]{1,32}$/.test(v) ? v : HIDDEN;
+  // Even an allowlisted key only passes through if the VALUE is in the documented
+  // domain for these variables: a number or a boolean. `\w` was far too wide —
+  // DISABLE_TELEMETRY=CLIENT_ACME_PROD passed it verbatim.
+  return /^(?:true|false|0|1|[0-9]{1,15}|[0-9]{1,12}\.[0-9]{1,4})$/i.test(v) ? v : HIDDEN;
 }
 
 /**
@@ -308,7 +325,10 @@ function parseFrontmatter(text) {
     // NON-SCALAR and its body consumed. Callers that need the key as a scalar
     // treat it as unparsed; callers that ignore the key are unaffected, which is
     // what keeps a `metadata:` block from invalidating a whole SKILL.md.
-    if (/^\s/.test(rawLine) || rawLine.trimStart().startsWith('-')) {
+    // `-foo: v` at column 0 is a top-level mapping KEY in YAML, because the dash
+    // is not followed by whitespace. Only a dash followed by space (or a bare
+    // dash) opens a sequence entry.
+    if (/^\s/.test(rawLine) || /^-(?:\s|$)/.test(rawLine)) {
       return reject('indented line outside a nested value');
     }
     const kv = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
@@ -325,7 +345,7 @@ function parseFrontmatter(text) {
       while (i + 1 < lines.length) {
         const next = lines[i + 1];
         if (next.trim() === '') { body.push(next); i++; continue; }
-        if (!/^\s/.test(next) && !next.trimStart().startsWith('-')) break;
+        if (!/^\s/.test(next) && !/^-(?:\s|$)/.test(next)) break;
         body.push(next); i++;
       }
       if (body.some((l) => l.trim() !== '')) {
@@ -373,6 +393,10 @@ function parseFrontmatter(text) {
     }
 
     value = value.trim();
+    // `model: # note` has no value at all; the comment is not the value. Emitting
+    // the comment text made a free-form string reach the default output through
+    // the agent model field.
+    if (value.startsWith('#')) { fm[key] = null; continue; }
     if (value === '') { fm[key] = null; continue; }
     if (value.startsWith('&') || value.startsWith('*') || value.startsWith('!')) {
       return reject(`anchor/alias/tag unsupported ('${key}')`);
@@ -458,7 +482,7 @@ function scanAgents(roots) {
       }
       items.push({
         name: ident(fm.name || basename(file, '.md')),
-        model: fm.model ? ident(fm.model, 40) : null,
+        model: fm.model == null ? null : modelLabel(fm.model),
         description: truncate(fm.description ?? '', 200) || null,
         descriptionLength: (fm.description ?? '').length,
         tools: fm.tools ? truncate(fm.tools, 60) : null,
@@ -515,15 +539,26 @@ function scanHooks(settingsFiles) {
   for (const h of items) byEvent[h.event] = (byEvent[h.event] || 0) + 1;
 
   // Referenced scripts: only existence and in-tree name are emitted.
+  // A relative or variable-rooted reference (./guard.sh, $CLAUDE_PROJECT_DIR/x.sh)
+  // resolves against a working directory this scanner does not know, so it can be
+  // COUNTED but not checked. Reporting only the absolute ones as "every script"
+  // overstated the check's coverage.
+  let unresolvedRefs = 0;
   const scriptRefs = [];
+  const scriptIndex = new Map();
   const seenPath = new Set();
   for (const { data } of settingsFiles) {
     for (const entries of Object.values(data?.hooks ?? {})) {
       if (!Array.isArray(entries)) continue;
       for (const e of entries) for (const h of e?.hooks ?? []) {
-        for (const p of String(h?.command ?? '').match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
+        const cmdText = String(h?.command ?? '');
+        for (const m of cmdText.match(/(?:^|[\s'"=(])((?:\.{1,2}\/|~\/|\$[A-Za-z_][\w]*\/)[\w.\-/$]*\.(?:mjs|js|sh|py|ts))\b/g) ?? []) {
+          if (m) unresolvedRefs++;
+        }
+        for (const p of cmdText.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
           if (seenPath.has(p)) continue;
           seenPath.add(p);
+          scriptIndex.set(p, scriptRefs.length);
           scriptRefs.push({ path: pathOf(p), name: basename(p), exists: existsSync(p) });
         }
       }
@@ -543,9 +578,19 @@ function scanHooks(settingsFiles) {
   //    error: it is logged and the tool call proceeds.
   const defects = { readsToolInputEnv: [], nonBlockingExit: [] };
   const inspect = (event, matcher, command, scriptPath) => {
-    const label = scriptPath
-      ? ident(basename(scriptPath), 60)
-      : `${REDACT ? enumOr(event, KNOWN_EVENTS, CUSTOM) : event}[${matcherLabel(matcher)}] inline`;
+    // A hook's script BASENAME is a substring of its command and a name the user
+    // chose, so it cannot appear in default output. Refer to the scriptRefs entry
+    // by index instead; --include-prose restores the readable name.
+    const ev = REDACT ? enumOr(event, KNOWN_EVENTS, CUSTOM) : event;
+    let label;
+    if (scriptPath) {
+      const idx = scriptIndex.get(scriptPath);
+      label = REDACT
+        ? `script-${String((idx ?? 0) + 1).padStart(2, '0')}`
+        : ident(basename(scriptPath), 60);
+    } else {
+      label = `${ev}[${matcherLabel(matcher)}] inline`;
+    }
     let text = command;
     if (scriptPath && existsSync(scriptPath)) text += '\n' + (readTextBounded(scriptPath) ?? '');
     const usesEnv = /\$\{?TOOL_INPUT|\$\{?CLAUDE_TOOL_INPUT/.test(text);
@@ -575,6 +620,7 @@ function scanHooks(settingsFiles) {
     byEvent,
     events: Object.keys(byEvent).sort(),
     scriptRefs,
+    unresolvedRefs,
     defects,
     missingTimeout: items.filter((h) => h.timeout == null).length,
   });
@@ -688,7 +734,11 @@ function scanMcp(settingsFiles, roots, userDir, projectPath) {
     key: String(name),
     name: ident(name),
     origin,
-    transport: cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null),
+    transport: (() => {
+      const t = cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null);
+      if (t == null) return null;
+      return REDACT ? enumOr(t, KNOWN_TRANSPORTS, CUSTOM) : ident(t, 20);
+    })(),
     command: cfg?.command ? ident(basename(String(cfg.command)), 40) : null,
     argsCount: Array.isArray(cfg?.args) ? cfg.args.length : 0,
     envKeys: cfg?.env && typeof cfg.env === 'object' ? Object.keys(cfg.env).map((k) => ident(k, 40)) : [],
@@ -796,12 +846,12 @@ function scanEnvironment(settingsFiles) {
 
   for (const { data } of settingsFiles) {
     if (!data) continue;
-    if (typeof data.model === 'string') model = ident(data.model, 60);
+    if (typeof data.model === 'string') model = modelLabel(data.model);
     if (data.statusLine && typeof data.statusLine === 'object') {
       const raw = String(data.statusLine.command ?? '');
       const ref = raw.match(/\/[\w.\-/]+\.(?:sh|mjs|js|py|ts)\b/)?.[0] ?? null;
       statusLine = {
-        type: ident(data.statusLine.type, 20),
+        type: REDACT ? enumOr(data.statusLine.type, KNOWN_STATUSLINE_TYPES, CUSTOM) : ident(data.statusLine.type, 20),
         command: describeCommand(data.statusLine.command),
         script: ref ? { name: basename(ref), exists: existsSync(ref) } : null,
       };
@@ -811,7 +861,11 @@ function scanEnvironment(settingsFiles) {
     }
     const p = data.permissions;
     if (p && typeof p === 'object' && !Array.isArray(p)) {
-      if (typeof p.defaultMode === 'string') permissions.defaultMode = ident(p.defaultMode, 30);
+      if (typeof p.defaultMode === 'string') {
+        permissions.defaultMode = REDACT
+          ? enumOr(p.defaultMode, KNOWN_PERMISSION_MODES, CUSTOM)
+          : ident(p.defaultMode, 30);
+      }
       for (const bucket of ['allow', 'deny', 'ask']) {
         const list = p[bucket];
         if (!Array.isArray(list)) continue;

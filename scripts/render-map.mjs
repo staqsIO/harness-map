@@ -363,7 +363,7 @@ function viewInventory() {
         const off = m.active === false;
         return `<tr${off ? ' class="row-off"' : ''}>
           <td class="mono strong">${esc(m.name)}</td>
-          <td class="mono dim">${esc(mcpOrigin(m))}${m.shadowed?.length ? ` <span class="dim">(shadows ${esc(m.shadowed.join(', '))})</span>` : ''}</td>
+          <td class="mono dim">${esc(mcpOrigin(m))}${arr(m.shadowed).length ? ` <span class="dim">(shadows ${esc(arr(m.shadowed).join(', '))})</span>` : ''}</td>
           <td class="mono dim">${esc(m.transport ?? '')}</td>
           <td>${off ? '<span class="chip neutral">inactive</span>' : '<span class="chip t-2">active</span>'}</td>
         </tr>`;
@@ -411,7 +411,7 @@ function viewAudit() {
       </div>
       <p class="finding-title">${esc(f.title)}</p>
       <p class="finding-detail">${esc(f.detail)}</p>
-      ${f.evidence?.length ? `<p class="finding-eq mono">${esc(f.evidence.slice(0, 8).join(' · '))}${f.evidence.length > 8 ? ` … +${f.evidence.length - 8}` : ''}</p>` : ''}
+      ${arr(f.evidence).length ? `<p class="finding-eq mono">${esc(arr(f.evidence).slice(0, 8).map(String).join(' · '))}${arr(f.evidence).length > 8 ? ` … +${num(arr(f.evidence).length - 8)}` : ''}</p>` : ''}
       ${f.why ? `<p class="finding-why">${esc(f.why)}</p>` : ''}
     </li>`;
 

@@ -134,15 +134,19 @@ const CHECKS = [
   {
     id: 'hooks.scripts-resolve',
     severity: 'high',
-    title: 'Every script referenced by a hook exists on disk',
-    why: 'A hook pointing at a missing script fails silently: the guard appears configured but never runs.',
+    title: 'Every absolute script path referenced by a hook exists on disk',
+    why: 'A hook pointing at a missing script fails silently: the guard appears configured but never runs. Coverage is limited to ABSOLUTE paths with a known extension — a relative or variable-rooted reference (./guard.sh, $CLAUDE_PROJECT_DIR/x.sh) resolves against a working directory the scanner does not know, so it is counted and reported but never checked.',
     applies: () => okLayer('hooks') && (L.hooks.scriptRefs ?? []).length > 0,
     run: () => {
       const refs = L.hooks.scriptRefs;
       const missing = refs.filter((r) => !r.exists).map((r) => r.path);
       return missing.length
         ? { status: FAIL, detail: `${missing.length} of ${refs.length} hook script(s) missing`, evidence: missing }
-        : { status: PASS, detail: `all ${refs.length} hook scripts resolve` };
+        : {
+            status: PASS,
+            detail: `all ${refs.length} absolute hook script path(s) resolve`
+              + (L.hooks.unresolvedRefs ? `; ${L.hooks.unresolvedRefs} relative reference(s) not checked` : ''),
+          };
     },
   },
   {

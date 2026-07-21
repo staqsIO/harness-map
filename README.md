@@ -125,6 +125,13 @@ Establishing blocking behaviour correctly requires faithfully reimplementing
 Claude Code's matcher semantics and hook runtime. That is a larger project than
 this tool, so the honest position is silence rather than a number.
 
+It also does not validate its own input. `audit-harness.mjs` accepts any JSON
+document, and every conclusion it prints — including the claim that the document
+carries no authored text — holds only for **unmodified scanner output**. There is
+no schema check and no provenance check. Treat a hand-edited or third-party
+`scan.json` as untrusted: the renderer escapes it, but the audit will happily
+describe it.
+
 What remains is provable from the scan document alone.
 
 ## Standalone use
@@ -150,10 +157,11 @@ and fails independently — a malformed agent file never takes down the scan.
 bash test/run-tests.sh
 ```
 
-66 checks covering graceful degradation on an empty config, credential
+86 checks covering graceful degradation on an empty config, credential
 suppression (with planted secrets in shapes a pattern-matcher cannot catch), the
-prose policy, MCP scope precedence, YAML strictness, symlink containment, HTML
-injection, and the self-contained/themed render contract.
+prose policy, MCP scope precedence, YAML conformance, symlink containment, HTML
+injection, hostile collection shapes, and the self-contained/themed render
+contract. Every defect found by cross-model review is pinned by a test here.
 
 ## License
 
