@@ -34,6 +34,7 @@
 
 import { readFileSync, readdirSync, existsSync, lstatSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { gate, DOCUMENT } from './emit-schema.mjs';
 import { join, basename, dirname, extname, relative, sep, isAbsolute } from 'node:path';
 
 const SCHEMA_VERSION = 2;
@@ -1173,8 +1174,15 @@ function main() {
     },
   };
 
-  applyProsePolicy(doc, opts.includeProse || !REDACT);
-  process.stdout.write(JSON.stringify(doc, null, opts.pretty ? 2 : 0) + '\n');
+  const prose = opts.includeProse || !REDACT;
+  // applyProsePolicy assigns the opaque labels (agent-01, script-02, rule-03) and
+  // relabels the collections that reference them. gate() then BUILDS the output
+  // document from the declared schema, so a field nobody declared cannot appear
+  // regardless of what the scanners produced. Two stages, in this order: the
+  // policy decides what a name becomes, the gate decides what may exist at all.
+  applyProsePolicy(doc, prose);
+  const out = gate(doc, DOCUMENT, { prose });
+  process.stdout.write(JSON.stringify(out, null, opts.pretty ? 2 : 0) + '\n');
   return 0;
 }
 

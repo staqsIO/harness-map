@@ -245,7 +245,7 @@ const CHECKS = [
     why: 'Servers bundled with a disabled plugin are inert. They read as available in config but never start.',
     applies: () => okLayer('mcp'),
     run: () => {
-      const dead = L.mcp.items.filter((m) => m.enabled === false).map((m) => `${m.name} (${m.plugin})`);
+      const dead = L.mcp.items.filter((m) => m.active === false).map((m) => `${m.name} (${m.plugin ?? 'plugin'})`);
       return dead.length
         ? { status: FAIL, detail: `${dead.length} server(s) behind a disabled plugin`, evidence: dead }
         : { status: PASS, detail: 'no stranded servers' };

@@ -93,12 +93,27 @@ Two opt-ins, in increasing order of exposure:
 | `--include-prose` | authored names, descriptions, rule headings | only after you read it |
 | `--include-values` | raw configuration values | no |
 
-**Why names are opt-in.** An earlier version emitted them and documented the risk
-instead of removing it. That was wrong: a name or description is free-form text
-you wrote, so it can hold a token, a customer, an internal hostname, or an
-incident detail, and no scan can reliably tell. Making the default structural
-means the safety comes from what is emitted rather than from pattern-matching what
-is caught — a distinction an earlier build got wrong in five separate places.
+**Why names are opt-in.** A name or description is free-form text you wrote, so it
+can hold a token, a customer, an internal hostname, or an incident detail, and no
+scan can reliably tell. The safety comes from what is emitted, not from
+pattern-matching what is caught.
+
+**The document is built from a declaration, not filtered on the way out.**
+`scripts/emit-schema.mjs` declares every field the output may contain and the
+shape each one must have; `gate()` constructs the document from that declaration.
+A field that is not listed there cannot appear, no matter what the scanners
+produce — so a field added to Claude Code, or to this tool, defaults to *absent*
+rather than to *emitted*.
+
+That design is the direct result of getting it wrong the other way. Redacting at
+each emission site protects the fields someone thought about, and three
+consecutive cross-model reviews each found fields nobody had: `settings.model`,
+`statusLine.type`, `permissions.defaultMode`, `mcpServers[].type`, agent `model`,
+hook defect labels, plugin `scope`, marketplace `type`, the key quoted inside a
+parse-warning message, rule filenames behind `proseRefs`. Every fix was correct
+and every round found more, because "no authored text anywhere" is a universal
+negative over a surface that keeps growing. One declaration is checkable by
+reading one file; fifteen scattered decisions are not.
 
 Rule files are read for headings only, and **symlinks are never followed** out of
 the configuration tree, so a symlinked `rules/*.md` cannot route an arbitrary

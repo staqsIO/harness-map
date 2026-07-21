@@ -136,7 +136,7 @@ check "$(j "$TMP/rich.json" "d['layers']['mcp']['otherProjectServers']>=1")" \
       "another project's servers are counted"
 check "$(! grep -q 'projA' "$TMP/rich.json" && echo true || echo false)" \
       "other project paths are never emitted"
-check "$(j "$TMP/rich.json" "any(m['name']=='pluginsrv' and m['enabled'] is False for m in d['layers']['mcp']['items'])")" \
+check "$(j "$TMP/rich.json" "any(m['name']=='pluginsrv' and m['active'] is False for m in d['layers']['mcp']['items'])")" \
       "marks servers from a disabled plugin as inactive"
 check "$(j "$TMP/rich.json" "'connectors' in d['layers']['mcp'].get('caveat','').lower()")" \
       "states the account-connector caveat"
@@ -393,6 +393,16 @@ node "$RENDER" --scan "$TMP/r4.json" --audit "$TMP/hostile2.json" \
   --out "$TMP/hostile2.html" 2>/dev/null
 check "$([ -s "$TMP/hostile2.html" ] && echo true || echo false)" \
       "renderer survives audit.findings and audit.passing as strings"
+
+# The gate's defining property is about fields that do not exist yet, so it is
+# tested directly rather than through a fixture.
+GATE_OUT="$(node "$ROOT/test/gate-test.mjs" 2>&1)"
+GATE_RC=$?
+echo "$GATE_OUT" | sed -n '2,$p' | grep -E '^  (ok|FAIL)' || true
+GATE_PASS=$(echo "$GATE_OUT" | grep -c '^  ok')
+GATE_FAIL=$(echo "$GATE_OUT" | grep -c '^  FAIL')
+PASS=$((PASS + GATE_PASS)); FAIL=$((FAIL + GATE_FAIL))
+[ $GATE_RC -ne 0 ] && [ "$GATE_FAIL" -eq 0 ] && { bad "gate test suite exited non-zero"; }
 
 echo "[manifests]"
 for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json; do
