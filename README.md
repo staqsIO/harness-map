@@ -156,6 +156,13 @@ Establishing blocking behaviour correctly requires faithfully reimplementing
 Claude Code's matcher semantics and hook runtime. That is a larger project than
 this tool, so the honest position is silence rather than a number.
 
+The two hook-contract detectors also read script bodies **verbatim, comments
+included**. A script that merely *documents* the `$TOOL_INPUT` mistake in a
+comment is reported as making it. That is a deliberate trade: stripping comments
+correctly across `sh`, Python and JavaScript means parsing three languages, and a
+detector that silently skipped a real `$TOOL_INPUT` inside a string literal would
+be the worse failure — a false PASS rather than a false FAIL.
+
 It also does not validate its own input. `audit-harness.mjs` accepts any JSON
 document, and every conclusion it prints — including the claim that the document
 carries no authored text — holds only for **unmodified scanner output**. Treat a
