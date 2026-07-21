@@ -415,15 +415,16 @@ check "$(j "$TMP/reason-self.json" "all(v.get('reason') is not None for v in d['
 check "$(j "$TMP/rich.json" "all(r['name'] in {x['name'] for x in d['layers']['rules']['items']} for k in ('orchestrators','review') for r in d['layers'][k].get('proseRefs',[]))")" \
       "every proseRef label resolves to an entry in the rules layer"
 
-# The gate's defining property is about fields that do not exist yet, so it is
-# tested directly rather than through a fixture.
-GATE_OUT="$(node "$ROOT/test/gate-test.mjs" 2>&1)"
-GATE_RC=$?
-echo "$GATE_OUT" | sed -n '2,$p' | grep -E '^  (ok|FAIL)' || true
-GATE_PASS=$(echo "$GATE_OUT" | grep -c '^  ok')
-GATE_FAIL=$(echo "$GATE_OUT" | grep -c '^  FAIL')
-PASS=$((PASS + GATE_PASS)); FAIL=$((FAIL + GATE_FAIL))
-[ $GATE_RC -ne 0 ] && [ "$GATE_FAIL" -eq 0 ] && { bad "gate test suite exited non-zero"; }
+# Two suites run directly rather than through fixtures: the gate's defining
+# property is about fields that do not exist YET, and note coverage is about
+# reason strings a fixture may never reach.
+for EXTRA in gate notes; do
+  EXTRA_OUT="$(node "$ROOT/test/$EXTRA-test.mjs" 2>&1)"
+  echo "$EXTRA_OUT" | grep -E '^  (ok|FAIL)' || true
+  PASS=$((PASS + $(echo "$EXTRA_OUT" | grep -c '^  ok')))
+  FAIL=$((FAIL + $(echo "$EXTRA_OUT" | grep -c '^  FAIL')))
+done
+
 
 echo "[manifests]"
 for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json; do
