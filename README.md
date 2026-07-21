@@ -186,7 +186,7 @@ and fails independently — a malformed agent file never takes down the scan.
 bash test/run-tests.sh
 ```
 
-157 checks covering graceful degradation on an empty config, credential
+159 checks covering graceful degradation on an empty config, credential
 suppression (with planted secrets in shapes a pattern-matcher cannot catch), the
 prose policy, MCP scope precedence, YAML conformance, symlink containment, HTML
 injection, hostile collection shapes, and the self-contained render contract.

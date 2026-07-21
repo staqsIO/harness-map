@@ -78,6 +78,12 @@ const HELP = `scan-harness — emit a JSON map of a Claude Code harness config
 `;
 
 let REDACT = true;
+// Names are opaque by default so output is safe to share. --include-prose opts
+// into authored names; that is a separate axis from --include-values, which opts
+// into raw VALUES. Labels that identify a file must follow PROSE, not REDACT --
+// keying them to REDACT left hook defects reading `script-05` in prose mode while
+// scriptRefs right beside them showed the real basename.
+let PROSE = false;
 const HIDDEN = '<hidden>';
 
 // ---------------------------------------------------------------------------
@@ -607,9 +613,9 @@ function scanHooks(settingsFiles) {
     let label;
     if (scriptPath) {
       const idx = scriptIndex.get(scriptPath);
-      label = REDACT
-        ? `script-${String((idx ?? 0) + 1).padStart(2, '0')}`
-        : ident(basename(scriptPath), 60);
+      label = PROSE
+        ? ident(basename(scriptPath), 60)
+        : `script-${String((idx ?? 0) + 1).padStart(2, '0')}`;
     } else {
       label = `${ev}[${matcherLabel(matcher)}] inline`;
     }
@@ -1159,6 +1165,7 @@ function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { process.stdout.write(HELP); return 0; }
   REDACT = !opts.includeValues;
+  PROSE = opts.includeProse || !REDACT;
 
   const userDir = opts.root ? opts.root : join(HOME, '.claude');
   const roots = [{ label: 'user', dir: userDir, claudeMd: join(userDir, 'CLAUDE.md') }];

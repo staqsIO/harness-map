@@ -241,6 +241,24 @@ check "$(j "$TMP/r4.json" "len(d['layers']['hooks']['defects']['readsToolInputEn
       "a hook reading \$TOOL_INPUT through a pipe is flagged"
 check "$(j "$TMP/r4.json" "len(d['layers']['hooks']['defects']['nonBlockingExit'])==1")" \
       "a PreToolUse hook exiting 1 with no exit 2 is flagged"
+
+# A defect label identifies a FILE, so it follows --include-prose, not
+# --include-values. Keying it to the wrong flag left the most actionable finding
+# in the report ("which of my hooks is dead?") reading `script-05` even in prose
+# mode, while scriptRefs right beside it showed the real basename.
+mkdir -p "$TMP/r4/.claude/hooks"
+cat > "$TMP/r4/.claude/settings-prose.json" <<JSON
+{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command",
+  "command":"sh $TMP/r4/.claude/hooks/guard.sh"}]}]}}
+JSON
+cp "$TMP/r4/.claude/settings-prose.json" "$TMP/r4/.claude/settings.json"
+printf '#!/bin/sh\necho "$TOOL_INPUT" | grep -q rm && exit 1\n' > "$TMP/r4/.claude/hooks/guard.sh"
+node "$SCAN" --root "$TMP/r4/.claude" > "$TMP/r4d.json" 2>/dev/null
+node "$SCAN" --root "$TMP/r4/.claude" --include-prose > "$TMP/r4p.json" 2>/dev/null
+check "$(j "$TMP/r4d.json" "d['layers']['hooks']['defects']['readsToolInputEnv']==['script-01']")" \
+      "a defect label indexes the script by default, never naming it"
+check "$(j "$TMP/r4p.json" "d['layers']['hooks']['defects']['readsToolInputEnv']==['guard.sh']")" \
+      "--include-prose names the offending script instead of indexing it"
 check "$(! grep -q 'CLIENT_ALPHA_INTERNAL\|CLIENT_CUSTOM_EVENT\|CLIENT_TYPE' "$TMP/r4.json" && echo true || echo false)" \
       "authored matcher, event and hook type never reach default output"
 check "$(j "$TMP/r4.json" "any(i['matcher']=='<custom>' for i in d['layers']['hooks']['items'])")" \
