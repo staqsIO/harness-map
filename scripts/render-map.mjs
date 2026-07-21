@@ -26,6 +26,7 @@ const arg = (name) => {
 };
 const scanPath = arg('--scan');
 const prosePath = arg('--prose');
+const auditPath = arg('--audit');
 const outPath = arg('--out');
 
 if (!scanPath || argv.includes('--help')) {
@@ -43,6 +44,7 @@ if (!scan) {
   process.exit(1);
 }
 const prose = prosePath ? readJson(prosePath, {}) : {};
+const audit = auditPath ? readJson(auditPath, null) : null;
 const L = scan.layers ?? {};
 
 // ---------------------------------------------------------------------------
@@ -339,6 +341,59 @@ function viewInventory() {
 }
 
 // ---------------------------------------------------------------------------
+// view: audit
+// ---------------------------------------------------------------------------
+
+function viewAudit() {
+  if (!audit) {
+    return `<div class="empty">
+      <p class="empty-title">Audit not run</p>
+      <p class="empty-reason">no audit document was supplied</p>
+      <p class="empty-hint">Run <code>audit-harness.mjs --scan scan.json --json</code> and pass it with <code>--audit</code>.</p>
+    </div>`;
+  }
+  const s = audit.summary ?? {};
+  const pct = s.applicable ? Math.round((s.passed / s.applicable) * 100) : 0;
+
+  const finding = (f) => `<li class="finding sev-${esc(f.severity)}">
+      <div class="finding-head">
+        <span class="sev mono">${esc(f.severity)}</span>
+        <span class="mono strong">${esc(f.id)}</span>
+      </div>
+      <p class="finding-title">${esc(f.title)}</p>
+      <p class="finding-detail">${esc(f.detail)}</p>
+      ${f.evidence?.length ? `<p class="finding-eq mono">${esc(f.evidence.slice(0, 8).join(' · '))}${f.evidence.length > 8 ? ` … +${f.evidence.length - 8}` : ''}</p>` : ''}
+      ${f.why ? `<p class="finding-why">${esc(f.why)}</p>` : ''}
+    </li>`;
+
+  const findings = (audit.findings ?? []).map(finding).join('');
+
+  return `<section class="block">
+      <h3>Result</h3>
+      <div class="audit-head">
+        <div class="audit-score">
+          <span class="audit-n mono">${s.passed}<span class="audit-of">/${s.applicable}</span></span>
+          <span class="audit-cap">applicable checks pass</span>
+        </div>
+        <div class="audit-bar" role="img" aria-label="${pct} percent of applicable checks pass">
+          <div class="audit-fill" style="width:${pct}%"></div>
+        </div>
+        <div class="pills">
+          <span class="pill sev-chip sev-high"><span class="pill-kind">high</span><span class="pill-n">${s.failedBySeverity?.high ?? 0}</span></span>
+          <span class="pill sev-chip sev-medium"><span class="pill-kind">medium</span><span class="pill-n">${s.failedBySeverity?.medium ?? 0}</span></span>
+          <span class="pill sev-chip sev-low"><span class="pill-kind">low</span><span class="pill-n">${s.failedBySeverity?.low ?? 0}</span></span>
+          ${s.notApplicable ? `<span class="pill"><span class="pill-kind">n/a</span><span class="pill-n">${s.notApplicable}</span></span>` : ''}
+        </div>
+      </div>
+      <p class="note dim">There is no weighted score. Each check is a named assertion that passes, fails, or does not apply, so the ratio means exactly what it says and nothing more.</p>
+    </section>
+    ${findings ? `<section class="block"><h3>Findings</h3><ul class="findings">${findings}</ul></section>`
+               : `<section class="block"><h3>Findings</h3><p class="note">Every applicable check passes.</p></section>`}
+    ${audit.passing?.length ? `<section class="block"><h3>Passing <span class="dim mono">${audit.passing.length}</span></h3>
+      <ul class="passlist">${audit.passing.map((p) => `<li><span class="mono">${esc(p.id)}</span> <span class="dim">${esc(p.detail ?? '')}</span></li>`).join('')}</ul></section>` : ''}`;
+}
+
+// ---------------------------------------------------------------------------
 // shell
 // ---------------------------------------------------------------------------
 
@@ -348,6 +403,10 @@ const TABS = [
   { id: 'orch', label: 'Orchestrators', layer: L.orchestrators, body: viewOrchestrators() },
   { id: 'review', label: 'Review pipeline', layer: L.review, body: viewReview() },
   { id: 'inv', label: 'Inventory', layer: L.commands, body: viewInventory() },
+  {
+    id: 'audit', label: 'Audit', body: viewAudit(),
+    layer: audit ? { status: (audit.summary?.failedBySeverity?.high ?? 0) > 0 ? 'error' : 'ok' } : { status: 'unconfigured' },
+  },
 ];
 
 const summaryChips = [
@@ -539,6 +598,35 @@ td.desc{color:var(--ink-2);max-width:460px}
 .rule-heads{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
 .rule-heads li{font-size:11.5px;color:var(--ink-3);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
+
+/* audit */
+.audit-head{display:flex;flex-direction:column;gap:11px}
+.audit-score{display:flex;align-items:baseline;gap:10px}
+.audit-n{font-size:38px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1;color:var(--ok)}
+.audit-of{font-size:20px;color:var(--ink-3);font-weight:400}
+.audit-cap{font-size:12.5px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.06em;
+  font-family:var(--mono)}
+.audit-bar{height:5px;background:var(--surface-2);border:1px solid var(--line);
+  border-radius:3px;overflow:hidden}
+.audit-fill{height:100%;background:var(--ok)}
+.sev-chip.sev-high .pill-n{color:var(--err)}
+.sev-chip.sev-medium .pill-n{color:var(--accent)}
+.sev-chip.sev-low .pill-n{color:var(--ink-2)}
+.findings,.passlist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px}
+.passlist{gap:3px;font-size:12.5px}
+.finding{border-left:2px solid var(--none);padding-left:13px;display:flex;
+  flex-direction:column;gap:3px}
+.finding.sev-high{border-left-color:var(--err)}
+.finding.sev-medium{border-left-color:var(--accent)}
+.finding-head{display:flex;align-items:center;gap:9px;font-size:12.5px}
+.sev{font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding:1px 6px;
+  border-radius:var(--radius);background:var(--surface-2);border:1px solid var(--line);color:var(--ink-2)}
+.sev-high .sev{background:var(--err);color:#fff;border-color:transparent}
+.sev-medium .sev{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.finding-title{margin:0;font-size:13.5px;font-weight:600}
+.finding-detail{margin:0;font-size:13px;color:var(--ink-2)}
+.finding-eq{margin:0;font-size:11.5px;color:var(--ink-3);overflow-wrap:anywhere}
+.finding-why{margin:3px 0 0;font-size:12.5px;color:var(--ink-3);max-width:66ch}
 
 /* empty state */
 .empty{border:1px dashed var(--line);border-radius:var(--radius);padding:20px;

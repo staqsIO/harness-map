@@ -28,16 +28,49 @@ Structural facts come from a deterministic scanner. Only the two prose-backed
 views involve model interpretation, and each degrades to an explicit empty state
 naming what is missing — the map never invents a routing rule you did not write.
 
-## Audit signals
+## Audit
 
-The scan surfaces drift that is easy to miss by eye:
+```bash
+node scripts/audit-harness.mjs --scan scan.json
+```
 
-- **Bare `inherit` agents** — an agent with `model: inherit` silently binds to
-  your session model, so a subagent built to be cheap can quietly run at the top
-  tier's cost.
-- **Unpinned agents** — no `model:` field at all.
+```
+HARNESS AUDIT   14/18 applicable checks pass
+                0 high · 1 medium · 3 low
+
+● MEDIUM skills.description-present
+         Every skill has a description
+         4 of 132 skills have no description
+         → gws-email-read, gws-inbox, gws-sanitize, portfolio-capture
+```
+
+**There is no composite score, on purpose.** Every check is a named assertion that
+returns pass, fail, or n/a with concrete evidence. A weighted 0–100 number would
+be this author's guesses about weights dressed up as measurement, and "you have
+132 skills" is not a strength — it is more trigger-collision surface to maintain.
+A check that cannot apply (no agents defined, so no agent checks) is **n/a rather
+than a failure**, which is what keeps the ratio comparable across very different
+configs.
+
+Exits non-zero only on a **high**-severity failure, so it works as a CI gate.
+
+What it asserts, and why each one is falsifiable rather than a matter of taste:
+
+- **A stated invariant with no mechanical enforcement.** If a rule file says
+  "never force-push to main" but no `PreToolUse` hook matches that pattern, the
+  invariant depends on the model remembering it. This is the check that found a
+  real gap in the author's own config.
+- **Hook scripts that do not exist on disk** — the guard looks configured in
+  `settings.json` and silently never runs.
+- **Bare `inherit` agents** — an agent with `model: inherit` adopts the session
+  model, so a subagent written to be cheap can run at the top tier's price with
+  nothing in the config making that visible.
+- **MCP servers stranded behind a disabled plugin** — present in config, never
+  started.
+- **Skills with a missing or very short `description`** — routing is driven by
+  the description, so a thin one fires inconsistently.
 - **Auto-compact threshold** — `CLAUDE_CODE_AUTO_COMPACT_WINDOW` fires at roughly
-  **84%** of the value you set, not at the value. The map does the arithmetic.
+  **84%** of the value you set, not at the value. The audit does the arithmetic.
 
 ## Privacy
 

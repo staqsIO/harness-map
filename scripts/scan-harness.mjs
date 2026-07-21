@@ -120,15 +120,32 @@ function parseFrontmatter(text) {
   const m = text.match(/^﻿?\s*---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!m) return null;
   const fm = {};
-  for (const rawLine of m[1].split(/\r?\n/)) {
+  const lines = m[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
     // Skip list items, nested keys, comments and blanks — we only want scalars.
     if (!rawLine.trim() || rawLine.trimStart().startsWith('#')) continue;
     if (/^\s/.test(rawLine) || rawLine.trimStart().startsWith('-')) continue;
     const kv = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
     if (!kv) continue;
-    let [, key, value] = kv;
-    value = value.trim();
-    if (
+    const key = kv[1];
+    let value = kv[2].trim();
+
+    // Block scalars: `key: >`, `>-`, `|`, `|-` … the real value is the indented
+    // block that follows. Without this, the value reads as a single ">" and any
+    // length-based check on it is nonsense.
+    const block = value.match(/^([>|])([-+]?)$/);
+    if (block) {
+      const body = [];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (next.trim() && !/^\s/.test(next)) break; // dedented: block is over
+        body.push(next.trim());
+        i++;
+      }
+      while (body.length && !body[body.length - 1]) body.pop();
+      value = block[1] === '>' ? body.join(' ').replace(/\s+/g, ' ').trim() : body.join('\n');
+    } else if (
       (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
       (value.startsWith("'") && value.endsWith("'") && value.length > 1)
     ) {
@@ -241,7 +258,49 @@ function scanHooks(settingsFiles) {
 
   const byEvent = {};
   for (const h of items) byEvent[h.event] = (byEvent[h.event] || 0) + 1;
-  return ok(items, { byEvent, events: Object.keys(byEvent).sort() });
+
+  // Audit facts computed from the FULL command text, which never leaves this
+  // function — only the resulting booleans and path-existence flags are emitted,
+  // so redaction is preserved.
+  const allCommands = [];
+  for (const { data } of settingsFiles) {
+    for (const entries of Object.values(data?.hooks ?? {})) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries) for (const h of e?.hooks ?? []) if (h?.command) allCommands.push(String(h.command));
+    }
+  }
+  const preToolText = (() => {
+    const out = [];
+    for (const { data } of settingsFiles) {
+      for (const e of data?.hooks?.PreToolUse ?? []) for (const h of e?.hooks ?? []) if (h?.command) out.push(String(h.command));
+    }
+    return out.join('\n').toLowerCase();
+  })();
+
+  const guards = {};
+  for (const [key, re] of Object.entries({
+    'rm -rf': /rm\s+-rf|rm\s+-fr/,
+    'drop table': /drop\s+table/,
+    'drop database': /drop\s+database/,
+    truncate: /truncate/,
+    'reset --hard': /reset\s+--hard/,
+    'force push': /push\s+(?:--force|-f)\b|--force-with-lease|force[\s-]?push/,
+    'secret files': /\.env|credential|secret|\.pem|\.key/,
+  })) guards[key] = re.test(preToolText);
+
+  // Absolute script paths referenced by any hook — a dangling one is a silent no-op.
+  const scriptRefs = [];
+  const seenPath = new Set();
+  for (const cmd of allCommands) {
+    for (const m of cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
+      if (seenPath.has(m)) continue;
+      seenPath.add(m);
+      scriptRefs.push({ path: scrub(m), exists: existsSync(m) });
+    }
+  }
+
+  const missingTimeout = items.filter((h) => h.timeout == null).length;
+  return ok(items, { byEvent, events: Object.keys(byEvent).sort(), guards, scriptRefs, missingTimeout });
 }
 
 function scanCommands(roots) {
@@ -279,6 +338,9 @@ function scanSkills(roots) {
       items.push({
         name: fm.name || entry,
         description: truncate(scrub(fm.description || ''), 160) || null,
+        // Full length matters for routing: a short description is a weak trigger
+        // surface, and the truncated field above cannot show that.
+        descriptionLength: (fm.description || '').length,
         userInvocable: fm.user_invocable === 'true' || fm.user_invocable === true || null,
         scope: label,
       });
@@ -453,7 +515,13 @@ function scanEnvironment(settingsFiles) {
     if (!data) continue;
     if (data.model) model = data.model;
     if (data.statusLine) {
-      statusLine = { type: data.statusLine.type ?? null, command: summarizeCommand(data.statusLine.command) };
+      const raw = String(data.statusLine.command ?? '');
+      const ref = raw.match(/\/[\w.\-/]+\.(?:sh|mjs|js|py|ts)\b/)?.[0] ?? null;
+      statusLine = {
+        type: data.statusLine.type ?? null,
+        command: summarizeCommand(data.statusLine.command),
+        script: ref ? { path: scrub(ref), exists: existsSync(ref) } : null,
+      };
     }
     if (data.env && typeof data.env === 'object') {
       for (const [k, v] of Object.entries(data.env)) env[k] = scrubPair(k, String(v));

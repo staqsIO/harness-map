@@ -73,8 +73,16 @@ check "$(j "$TMP/min.json" "d['layers']['mcp']['status']=='unconfigured'")" \
 
 # --- 3. malformed input ------------------------------------------------------
 echo "[resilience]"
-check "$(j "$TMP/rich.json" "len(d['layers']['agents']['items'])==1")" "agent with unterminated frontmatter is skipped, not fatal"
-check "$(j "$TMP/rich.json" "d['layers']['agents']['items'][0]['model']=='haiku'")" "parses a scalar containing a colon"
+check "$(j "$TMP/rich.json" "len(d['layers']['agents']['items'])==3")" "agent with unterminated frontmatter is skipped, not fatal"
+check "$(j "$TMP/rich.json" "any(a['name']=='solo' and a['model']=='haiku' for a in d['layers']['agents']['items'])")" "parses a scalar containing a colon"
+# Regression: `description: >` used to read as the literal ">" (length 1), which
+# made every length-based audit check fire a false positive.
+check "$(j "$TMP/rich.json" "any(a['name']=='folded' and a['description'].startswith('A folded description that spans several') for a in d['layers']['agents']['items'])")" \
+      "folded block scalar (>) is joined into one line"
+check "$(j "$TMP/rich.json" "any(a['name']=='literal' and 'Line one' in a['description'] and 'Line two' in a['description'] for a in d['layers']['agents']['items'])")" \
+      "literal block scalar (|) preserves both lines"
+check "$(j "$TMP/rich.json" "all(len(a['description'] or '')>1 for a in d['layers']['agents']['items'])")" \
+      "no description collapses to a bare block-scalar marker"
 
 node "$SCAN" --root /nonexistent/path/xyz > "$TMP/none.json" 2>/dev/null
 check "$([ $? -eq 0 ] && echo true || echo false)" "nonexistent root exits 0"
@@ -93,6 +101,20 @@ OPEN=$(grep -o '<div\b' "$TMP/rich.html" | wc -l | tr -d ' ')
 CLOSE=$(grep -o '</div>' "$TMP/rich.html" | wc -l | tr -d ' ')
 check "$([ "$OPEN" = "$CLOSE" ] && echo true || echo false)" "balanced <div> tags ($OPEN/$CLOSE)"
 check "$(grep -q 'class="scroll"' "$TMP/rich.html" && echo true || echo false)" "tables are wrapped for horizontal scroll"
+
+# --- 4b. audit ----------------------------------------------------------------
+echo "[audit]"
+node "$ROOT/scripts/audit-harness.mjs" --scan "$TMP/rich.json" --json > "$TMP/audit.json" 2>/dev/null
+check "$(j "$TMP/audit.json" "'summary' in d and 'findings' in d")" "emits a structured report"
+check "$(j "$TMP/audit.json" "d['summary']['passed']<=d['summary']['applicable']")" "passed never exceeds applicable"
+check "$(j "$TMP/audit.json" "all(f['status']=='fail' for f in d['findings'])")" "findings contain only failures"
+check "$(j "$TMP/audit.json" "all(f.get('evidence') or f.get('detail') for f in d['findings'])")" "every finding carries evidence or detail"
+check "$(j "$TMP/audit.json" "[['high','medium','low'].index(f['severity']) for f in d['findings']] == sorted([['high','medium','low'].index(f['severity']) for f in d['findings']])")" \
+      "findings are ordered most-severe first"
+# n/a must not be counted as failure — that is what keeps the ratio honest.
+node "$ROOT/scripts/audit-harness.mjs" --scan "$TMP/min.json" --json > "$TMP/audit-min.json" 2>/dev/null
+check "$(j "$TMP/audit-min.json" "d['summary']['notApplicable']>0")" "empty config yields n/a checks, not failures"
+check "$(j "$TMP/audit-min.json" "all(f['status']!='n/a' for f in d['findings'])")" "n/a checks never appear as findings"
 
 # --- 5. manifests are valid ---------------------------------------------------
 echo "[manifests]"

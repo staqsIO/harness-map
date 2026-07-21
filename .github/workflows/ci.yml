@@ -17,3 +17,7 @@ jobs:
         run: bash test/run-tests.sh
       - name: Scan this runner's (empty) config without crashing
         run: node scripts/scan-harness.mjs --pretty > /dev/null
+      - name: Audit gate (fails on high-severity findings)
+        run: |
+          node scripts/scan-harness.mjs > /tmp/scan.json
+          node scripts/audit-harness.mjs --scan /tmp/scan.json

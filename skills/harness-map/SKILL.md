@@ -75,20 +75,31 @@ entirely — do not impose a HUB/JUDGE/BULK scheme on a config that has no tiers
 If a layer is `unconfigured`, skip it. The renderer draws an empty state that
 names what is missing, which is more useful than a guess.
 
-## Step 3 — render and publish
+## Step 3 — audit
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/audit-harness.mjs" --scan /tmp/hm-scan.json --json > /tmp/hm-audit.json
+```
+
+Deterministic — do not second-guess its verdicts or add findings of your own to
+the JSON. It exits non-zero when a high-severity check fails.
+
+## Step 4 — render and publish
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/render-map.mjs" \
-  --scan /tmp/hm-scan.json --prose /tmp/hm-prose.json --out /tmp/harness-map.html
+  --scan /tmp/hm-scan.json --prose /tmp/hm-prose.json \
+  --audit /tmp/hm-audit.json --out /tmp/harness-map.html
 ```
 
 Publish `/tmp/harness-map.html` with the Artifact tool. Use favicon `🗺️` and keep
-it stable across redeploys. Omit `--prose` when there is nothing to interpret.
+it stable across redeploys. Omit `--prose` or `--audit` when you do not have them.
 
 ## Reporting back
 
-Summarize in a few lines: counts per layer, which layers were unconfigured, and
-any **drift worth flagging** the scanner surfaced:
+Lead with the audit headline (`N/M applicable checks pass`, high/medium/low
+counts) and any high-severity finding, then counts per layer and which layers were
+unconfigured. Also flag drift the scanner surfaced:
 
 - `layers.agents.bareInherit` — agents on bare `inherit` silently bind to the
   session model, so a bulk agent can quietly run at the top tier's cost.
