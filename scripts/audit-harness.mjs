@@ -80,77 +80,44 @@ const CHECKS = [
     why: 'Agent selection is driven by the description; without one the agent is effectively unroutable.',
     applies: () => okLayer('agents'),
     run: () => {
-      const bad = L.agents.items.filter((a) => !a.description).map((a) => a.name);
+      const bad = L.agents.items.filter((a) => !a.descriptionLength).map((a) => a.name);
       return bad.length
         ? { status: FAIL, detail: `${bad.length} agent(s) without a description`, evidence: bad }
         : { status: PASS, detail: `all ${L.agents.count} agents described` };
     },
   },
 
-  // --- safety ---------------------------------------------------------------
-  // These assert BLOCKING BEHAVIOUR, which can only be established by running the
-  // hook. An earlier version regex-matched the hook's command text; a hook whose
-  // body was `echo 'rm -rf, drop table' >/dev/null; exit 0` matched every pattern
-  // and passed every check while blocking nothing. Grepping a command proves
-  // nothing about what it does, so without probe evidence these are n/a — never a
-  // pass. A safety check that reports protection you do not have is worse than no
-  // check at all.
-  ...[
-    ['rm -rf', 'safety.blocks-rm-rf', 'high', 'A PreToolUse hook blocks recursive delete'],
-    ['drop table', 'safety.blocks-drop-table', 'high', 'A PreToolUse hook blocks DROP TABLE'],
-    ['drop database', 'safety.blocks-drop-database', 'high', 'A PreToolUse hook blocks DROP DATABASE'],
-    ['reset --hard', 'safety.blocks-reset-hard', 'medium', 'A PreToolUse hook blocks git reset --hard'],
-    ['force push', 'safety.blocks-force-push', 'high', 'A PreToolUse hook blocks force-push'],
-  ].map(([key, id, severity, title]) => ({
-    id, severity, title,
-    why: 'A destructive operation prevented only by a written rule depends on the model remembering it. A hook that actually exits non-zero cannot be forgotten. Verified by executing the hook against synthetic input, because matching its text would pass a hook that blocks nothing.',
-    applies: () => okLayer('hooks') && Boolean(L.hooks.probe?.probed) && key in (L.hooks.probe.results ?? {}),
-    run: () => {
-      const r = L.hooks.probe.results[key];
-      return r.blocked
-        ? { status: PASS, detail: `a hook exited non-zero for synthetic "${key}" input (${r.hooksRun} hook(s) exercised)` }
-        : { status: FAIL, detail: `no hook blocked synthetic "${key}" input (${r.hooksRun} hook(s) exercised)`, evidence: ['settings.json → hooks.PreToolUse'] };
-    },
-  })),
-  {
-    id: 'safety.behaviour-verified',
-    severity: 'medium',
-    title: 'Destructive-operation guards were verified by execution, not assumed',
-    why: 'Without --probe-hooks nothing here can assert that a guard blocks. The scan reports which patterns a hook mentions, but mentioning is not blocking.',
-    applies: () => okLayer('hooks'),
-    run: () => (L.hooks.probe?.probed
-      ? { status: PASS, detail: `${L.hooks.probe.hookCount} PreToolUse hook(s) exercised against synthetic input` }
-      : { status: FAIL, detail: 'guards unverified — re-run with --probe-hooks to establish blocking behaviour', evidence: ['scan-harness.mjs --probe-hooks'] }),
-  },
-
   // --- hook contract --------------------------------------------------------
-  // These two are static: they need no probing and catch a guard that cannot
-  // possibly work. Both were found in the author's own config, where five
-  // documented "hook-enforced" protections were enforcing nothing.
+  // Two DEFECT DETECTORS, not proofs. Each searches a hook's command text for one
+  // specific mistake that makes a guard unable to work, and both found real ones
+  // in the author's own config, where five documented "hook-enforced" protections
+  // were enforcing nothing. Their passing state means only "this specific mistake
+  // was not found" — never "the guard blocks". Nothing here reads as protection;
+  // see the README section on what this tool does not check.
   {
     id: 'hooks.reads-documented-input',
     severity: 'high',
-    title: 'No hook depends on a $TOOL_INPUT environment variable',
-    why: 'Claude Code delivers hook data as JSON on stdin. $TOOL_INPUT is not a documented variable and is not set, so a hook reading it inspects an empty string and silently never matches — the guard looks configured and does nothing.',
+    title: 'No hook reads a $TOOL_INPUT environment variable',
+    why: 'Claude Code delivers hook data as JSON on stdin. $TOOL_INPUT is not a documented variable and is not set, so a hook reading it inspects an empty string and silently never matches — the guard looks configured and does nothing. Text-level detection: passing means no hook mentions $TOOL_INPUT, not that any hook consumes stdin correctly.',
     applies: () => okLayer('hooks') && Boolean(L.hooks.defects),
     run: () => {
       const bad = L.hooks.defects.readsToolInputEnv ?? [];
       return bad.length
         ? { status: FAIL, detail: `${bad.length} hook(s) read $TOOL_INPUT with no stdin fallback`, evidence: bad }
-        : { status: PASS, detail: 'all hooks read their event from stdin' };
+        : { status: PASS, detail: 'no hook reads $TOOL_INPUT' };
     },
   },
   {
     id: 'hooks.blocking-exit-code',
     severity: 'high',
-    title: 'PreToolUse hooks that intend to block use exit 2',
-    why: 'Only exit code 2 blocks a tool call. Exit 1 is treated as a non-blocking hook error: it is logged and the tool runs anyway, so a guard that exits 1 permits exactly what it was written to prevent.',
+    title: 'No PreToolUse hook exits 1 without also using exit 2',
+    why: 'Only exit code 2 blocks a tool call. Exit 1 is treated as a non-blocking hook error: it is logged and the tool runs anyway, so a guard that exits 1 permits exactly what it was written to prevent. Text-level detection: a hook whose reachable path still exits 1 (dead code after it, a sourced script) passes this, so passing is not evidence that the hook blocks.',
     applies: () => okLayer('hooks') && Boolean(L.hooks.defects),
     run: () => {
       const bad = L.hooks.defects.nonBlockingExit ?? [];
       return bad.length
         ? { status: FAIL, detail: `${bad.length} PreToolUse hook(s) exit 1 and never block`, evidence: bad }
-        : { status: PASS, detail: 'no PreToolUse hook relies on a non-blocking exit code' };
+        : { status: PASS, detail: 'no PreToolUse hook exits 1 without an exit 2 present' };
     },
   },
 

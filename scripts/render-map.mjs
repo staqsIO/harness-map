@@ -10,7 +10,8 @@
  * Zero dependencies. Emits HTML on stdout (or to --out).
  *
  * Usage:
- *   node render-map.mjs --scan scan.json [--prose prose.json] [--out map.html]
+ *   node render-map.mjs --scan scan.json [--prose prose.json]
+ *                       [--audit audit.json] [--out map.html]
  */
 
 import { readFileSync, writeFileSync, statSync } from 'node:fs';
@@ -77,7 +78,9 @@ const num = (v, fallback = 0) => {
 /** Clamp for CSS numeric contexts (width, flex), where even a number needs bounds. */
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, num(v, lo)));
 
-const has = (layer) => layer?.status === 'ok';
+// A layer only counts as present when its items are actually a list: a
+// substituted document can set status:'ok' with items as a string or object.
+const has = (layer) => layer?.status === 'ok' && (layer.items === undefined || Array.isArray(layer.items));
 const statusOf = (layer) => layer?.status ?? 'unconfigured';
 
 /**
@@ -125,6 +128,11 @@ function viewAgents() {
     });
   }
 
+  const proseNote = scan.prose ? '' :
+    `<p class="note dim">Names appear as stable labels and descriptions are withheld, because
+     authored text can contain anything and no scan can vet it. Re-run with
+     <code>--include-prose</code> to read them; that output is no longer safe to share unreviewed.</p>`;
+
   const byModel = layer.byModel ?? {};
   const declaredTiers = Array.isArray(prose?.tiers) ? prose.tiers : null;
 
@@ -151,16 +159,17 @@ function viewAgents() {
     warnings.push(`<p class="warn"><strong>${num(layer.unpinned.length)}</strong> agent(s) with no <code>model:</code> field: ${layer.unpinned.map(esc).join(', ')}</p>`);
   }
 
+  const showDesc = layer.items.some((a) => a.description);
   const rows = layer.items.map((a) => `<tr>
       <td class="mono strong">${esc(a.name)}</td>
       <td><span class="chip ${tierClass(a.model)}">${esc(a.model ?? 'unset')}</span></td>
-      <td class="desc">${esc(a.description ?? '')}</td>
+      ${showDesc ? `<td class="desc">${esc(a.description ?? '')}</td>` : ''}
       <td class="mono dim">${esc(a.scope)}</td>
     </tr>`).join('');
 
-  return `${tierCards}${ramp}${warnings.join('')}
+  return `${proseNote}${tierCards}${ramp}${warnings.join('')}
     <div class="scroll"><table>
-      <thead><tr><th>Agent</th><th>Model</th><th>Purpose</th><th>Scope</th></tr></thead>
+      <thead><tr><th>Agent</th><th>Model</th>${showDesc ? '<th>Purpose</th>' : ''}<th>Scope</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>`;
 }
@@ -450,10 +459,12 @@ const summaryChips = [
   ['Agents', L.agents], ['Hooks', L.hooks], ['Commands', L.commands],
   ['Skills', L.skills], ['Plugins', L.plugins], ['MCP', L.mcp],
 ].map(([label, layer]) => {
-  const s = statusOf(layer);
-  const n = layer?.count ?? 0;
+  // `status` reaches a class attribute and `count` reaches text, both from an
+  // untrusted document — map status through a closed enum and coerce the count.
+  const raw = statusOf(layer);
+  const s = ['ok', 'unconfigured', 'error'].includes(raw) ? raw : 'unconfigured';
   return `<div class="stat s-${s}">
-    <span class="stat-n mono">${s === 'ok' ? n : '—'}</span>
+    <span class="stat-n mono">${s === 'ok' ? num(layer?.count) : '—'}</span>
     <span class="stat-l">${esc(label)}</span>
   </div>`;
 }).join('');
@@ -690,6 +701,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:va
     <p class="sub">The agents, hooks, and routing that shape this Claude Code session.</p>
     <div class="meta">
       <span>${scan.redacted ? 'redacted' : '⚠ UNREDACTED — contains raw values'}</span>
+      <span>${scan.prose ? '⚠ includes authored names — review before sharing' : 'names hidden'}</span>
       <span>schema v${esc(scan.schemaVersion)}</span>
       ${(scan.sources ?? []).map((s) => `<span>${esc(s.scope)}: ${esc(s.path)}${s.exists ? '' : ' (missing)'}</span>`).join('')}
     </div>
@@ -699,7 +711,8 @@ footer{border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:va
 
   <div class="tabs" role="tablist">
     ${TABS.map((t, i) => {
-      const s = statusOf(t.layer);
+      const raw = statusOf(t.layer);
+      const s = ['ok', 'unconfigured', 'error'].includes(raw) ? raw : 'unconfigured';
       const cls = s === 'ok' ? '' : s === 'error' ? ' is-error' : ' is-none';
       return `<button class="tab${cls}" role="tab" id="tab-${t.id}" aria-controls="panel-${t.id}"
         aria-selected="${i === activeIdx}" tabindex="${i === activeIdx ? 0 : -1}">

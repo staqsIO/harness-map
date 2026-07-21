@@ -2,7 +2,7 @@
 name: harness-map
 description: Visualize a Claude Code harness setup — agents and their model tiers, hooks across the session lifecycle, orchestrator routing, the review pipeline, and installed commands/skills/plugins/MCP servers — as an interactive page. Use when the user says "/harness-map", "visualize my harness", "show my Claude Code setup", "map my agents and hooks", "what hooks do I have", "diagram my config", or asks how their harness is wired. Also use when auditing a config for model-tier drift (bare `inherit`, unpinned agents) or reviewing which hooks fire when.
 user_invocable: true
-argument-hint: "[--project <path>] [--include-values]"
+argument-hint: "[--project <path>] [--include-prose]"
 license: MIT
 ---
 
@@ -33,8 +33,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/scan-harness.mjs" --pretty > /tmp/hm-scan.js
 ```
 
 Add `--project <path>` to include a project-level `.claude/` and `CLAUDE.md`.
-Add `--include-values` **only** if the user explicitly asks for unredacted output;
-warn them the result must not be shared.
+By default names appear as opaque labels (`agent-01`) and descriptions are
+withheld, so the output is shareable. Add `--include-prose` when the user wants a
+readable map — and tell them the result should be reviewed before sharing. Add
+`--include-values` only on an explicit request; that output must not be shared.
 
 Read the result. Every layer carries `status`:
 
@@ -91,12 +93,6 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/audit-harness.mjs" --scan /tmp/hm-scan.json 
 Deterministic — do not second-guess its verdicts or add findings of your own to
 the JSON. It exits non-zero when a high-severity check fails.
 
-**Safety checks need probe evidence.** Without `--probe-hooks` on the scan, the
-`safety.blocks-*` checks are `n/a` and `safety.behaviour-verified` fails. Do not
-describe the user as protected in that state — say the guards are unverified and
-offer the probe. Only offer it; never add `--probe-hooks` on your own initiative,
-because it executes their hook commands.
-
 ## Step 4 — render and publish
 
 ```bash
@@ -124,20 +120,16 @@ Do not editorialize beyond what the scan shows.
 
 ## Privacy
 
-The scanner emits an **allowlist** of structurally safe shapes. It does not try
-to detect secrets — that approach failed review, because an ordinary key name can
-hold a credential.
+The default document contains only structural shapes — counts, enums, booleans,
+root-relative paths, and opaque labels in place of authored names. Environment
+values, command text, MCP URLs and hostnames, permission rule arguments and
+absolute paths are never emitted.
 
-**Never emitted by default:** environment values (outside a short allowlist of
-non-sensitive Claude Code variables), hook and status-line command text, MCP URLs
-and hostnames, permission rule arguments, absolute paths, and other projects'
-paths.
+`--include-prose` adds authored names, descriptions and rule headings. That output
+is readable but should be reviewed before sharing, because free-form text can
+contain anything. Say so when the user asks about sharing; do not call any output
+universally safe.
 
-**Deliberately emitted:** the names you authored (agents, skills, commands,
-servers, plugins), their descriptions, and rule-file headings. These are the map.
-They are also free-form text you wrote, so a page is only as shareable as those
-names are — say so when the user asks about sharing, rather than calling the
-output universally safe.
-
-`--include-values` disables the allowlist entirely; output from it must not be
-shared. Artifacts are private until the user shares them.
+Never claim the user is protected against a destructive operation. This tool does
+not verify hook blocking behaviour — see the README section on what it does not
+check.

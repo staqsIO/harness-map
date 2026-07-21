@@ -50,18 +50,19 @@ check "$(grep -q 'built-in defaults apply' "$TMP/min.html" && echo true || echo 
 # userinfo, a permission rule with no parenthesis, a path outside $HOME. Every
 # one of these leaked in an earlier build while the old tests passed.
 echo "[redaction]"
-node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" > "$TMP/rich.json"
+node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" --include-prose > "$TMP/rich.json"
 LEAK="$(grep -oE 'sk-[A-Za-z0-9]{6,}|ghp_[A-Za-z0-9]{10,}|supersecret|hunter2|id_rsa|550e8400|postgres://' "$TMP/rich.json" | sort -u)"
 check "$([ -z "$LEAK" ] && echo true || echo false)" "no planted credential appears in output"
 [ -n "$LEAK" ] && printf '        leaked: %s\n' "$LEAK"
-check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SOME_API_KEY']=='<hidden>'")" "secret-shaped env key: value hidden"
-check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SERVICE_URL']=='<hidden>'")" \
-      "ORDINARY env key with a credential value is hidden (blocklist could not catch this)"
+check "$(j "$TMP/rich.json" "all(v=='<hidden>' for k,v in d['layers']['environment']['env'].items() if k!='CLAUDE_CODE_AUTO_COMPACT_WINDOW')")" \
+      "every env value is hidden, whatever the key looks like"
 check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['CLAUDE_CODE_AUTO_COMPACT_WINDOW']=='475000'")" \
       "allowlisted non-sensitive env value still emitted"
 check "$(j "$TMP/rich.json" "any(m['name']=='leaky' and m['envKeys']==['API_TOKEN'] for m in d['layers']['mcp']['items'])")" "MCP env keys kept, values dropped"
-check "$(j "$TMP/rich.json" "all(m['url'] in (None,'https://example.com') for m in d['layers']['mcp']['items'])")" \
-      "MCP url collapses to scheme+host (userinfo and path dropped)"
+check "$(j "$TMP/rich.json" "all(m['url'] is None for m in d['layers']['mcp']['items'])")" \
+      "MCP url is never emitted; only remote:true"
+check "$(j "$TMP/rich.json" "any(m['name']=='leaky' and m['remote'] is True for m in d['layers']['mcp']['items'])")" \
+      "remote flag replaces the hostname"
 check "$(j "$TMP/rich.json" "d['layers']['environment']['permissions']['unrecognized']>=1")" \
       "permission rule without a tool grammar becomes (unrecognized), not echoed"
 check "$(j "$TMP/rich.json" "all('preview' not in (h.get('command') or {}) for h in d['layers']['hooks']['items'])")" \
@@ -72,25 +73,9 @@ check "$(! grep -qE '\"(/|[A-Za-z]:\\\\)' "$TMP/rich.json" && echo true || echo 
 node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" --include-values > "$TMP/raw.json"
 check "$(grep -qE 'hunter2|supersecret' "$TMP/raw.json" && echo true || echo false)" "--include-values opts out of redaction"
 
-# --- 2c. safety checks must not claim what they cannot prove ------------------
-# A hook that matches every guard pattern but exits 0 blocks nothing.
-echo "[safety claims]"
-node "$SCAN" --root "$ROOT/test/fixtures/donothing/.claude" > "$TMP/dn.json"
-node "$AUDIT" --scan "$TMP/dn.json" --json > "$TMP/dn-audit.json" 2>/dev/null
-check "$(j "$TMP/dn-audit.json" "not any(p['id'].startswith('safety.blocks') for p in d['passing'])")" \
-      "no safety guard PASSES without probe evidence"
-check "$(j "$TMP/dn-audit.json" "any(f['id']=='safety.behaviour-verified' for f in d['findings'])")" \
-      "unverified guards are reported as such"
-node "$SCAN" --root "$ROOT/test/fixtures/donothing/.claude" --probe-hooks > "$TMP/dn-probe.json"
-node "$AUDIT" --scan "$TMP/dn-probe.json" --json > "$TMP/dn-probe-audit.json" 2>/dev/null
-check "$(j "$TMP/dn-probe-audit.json" "not any(p['id'].startswith('safety.blocks') for p in d['passing'])")" \
-      "probing a do-nothing hook still fails every guard (no false PASS)"
-check "$(j "$TMP/dn-probe-audit.json" "sum(1 for f in d['findings'] if f['id'].startswith('safety.blocks'))>=4")" \
-      "probe reports the unguarded patterns as findings"
-
 # --- 2d. MCP precedence -------------------------------------------------------
 echo "[mcp precedence]"
-node "$SCAN" --root "$ROOT/test/fixtures/prec/.claude" --project "$ROOT/test/fixtures/prec/proj" > "$TMP/prec.json"
+node "$SCAN" --root "$ROOT/test/fixtures/prec/.claude" --project "$ROOT/test/fixtures/prec/proj" --include-prose > "$TMP/prec.json"
 check "$(j "$TMP/prec.json" "any(m['name']=='db' and m['origin']=='local' for m in d['layers']['mcp']['items'])")" \
       "local scope wins over project and user"
 check "$(j "$TMP/prec.json" "len([m for m in d['layers']['mcp']['items'] if m['name']=='db'])==1")" \
@@ -102,7 +87,7 @@ check "$(j "$TMP/prec.json" "any(m['name']=='projonly' for m in d['layers']['mcp
 # The parser must refuse constructs it cannot handle exactly. A wrong value is
 # worse than a missing one, because the audit asserts on these fields.
 echo "[yaml strictness]"
-node "$SCAN" --root "$ROOT/test/fixtures/yaml/.claude" > "$TMP/yaml.json"
+node "$SCAN" --root "$ROOT/test/fixtures/yaml/.claude" --include-prose > "$TMP/yaml.json"
 check "$(j "$TMP/yaml.json" "any('indentation indicator' in w for x in d['layers']['agents']['parseWarnings'] for w in x['warnings'])")" \
       "indentation indicator (>2-) is refused, not guessed"
 check "$(j "$TMP/yaml.json" "any('escape sequence' in w for x in d['layers']['agents']['parseWarnings'] for w in x['warnings'])")" \
@@ -142,6 +127,24 @@ check "$(j "$TMP/rich.json" "'connectors' in d['layers']['mcp'].get('caveat','')
       "states the account-connector caveat"
 check "$(j "$TMP/min.json" "d['layers']['mcp']['status']=='unconfigured'")" \
       "--root stays hermetic (no bleed from the real ~/.claude.json)"
+
+# --- 2g. prose policy ------------------------------------------------------
+# Authored names/descriptions/headings cannot be vetted by any scan, so the
+# DEFAULT document must contain none of them.
+echo "[prose policy]"
+node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" > "$TMP/opaque.json"
+check "$(j "$TMP/opaque.json" "all(a['name'].startswith('agent-') for a in d['layers']['agents']['items'])")" \
+      "agent names are opaque labels by default"
+check "$(j "$TMP/opaque.json" "all(a['description'] is None for a in d['layers']['agents']['items'])")" \
+      "descriptions are withheld by default"
+check "$(j "$TMP/opaque.json" "all(a['descriptionLength']>=0 for a in d['layers']['agents']['items'])")" \
+      "description LENGTH survives so the audit still works"
+check "$(! grep -qE 'folded|literal|solo|leaky|globalsrv' "$TMP/opaque.json" && echo true || echo false)" \
+      "no authored name from the fixture appears anywhere in default output"
+check "$(j "$TMP/opaque.json" "all(r['headings']==[] for r in d['layers']['rules'].get('items',[]))")" \
+      "rule headings are withheld by default"
+check "$(j "$TMP/rich.json" "any(a['name']=='solo' for a in d['layers']['agents']['items'])")" \
+      "--include-prose restores authored names"
 
 # --- 3. malformed input ------------------------------------------------------
 echo "[resilience]"

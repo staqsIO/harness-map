@@ -6,38 +6,34 @@
  * harness topology: agents and their model bindings, hooks, commands, skills,
  * plugins, MCP servers, and pointers to prose rule files.
  *
- * PRIVACY MODEL — ALLOWLIST, NOT BLOCKLIST.
- * An earlier version tried to redact values that "looked like" secrets. That
- * cannot work: `SERVICE_URL=postgres://admin:pw@host` is neither a secret-shaped
- * key nor a branded token, and it leaked verbatim. The space of things that look
- * like a credential is unbounded, so a blocklist can never support a
- * "safe to share" guarantee.
- *
- * This version emits ONLY structurally safe shapes:
- *   - identifiers the user authored (agent/skill/command/server/plugin names)
+ * PRIVACY MODEL — ALLOWLIST, PLUS A PROSE OPT-IN.
+ * Redaction by pattern ("hide things that look secret") cannot support a
+ * safe-to-share claim: `SERVICE_URL=postgres://admin:pw@host` is neither a
+ * secret-shaped key nor a branded token, and it leaked verbatim. So the default
+ * document contains only shapes that cannot carry a secret:
  *   - enumerations (model, transport, scope, event, status)
- *   - counts and booleans
- *   - paths relative to a scanned root; never absolute paths
- * Free-form values are never emitted: no env values (outside a known-safe
- * allowlist of non-sensitive Claude Code variables), no hook or status-line
- * command text, no MCP URLs, no permission rule arguments.
+ *   - counts, booleans, timeouts
+ *   - paths relative to a scanned root; never absolute
+ *   - opaque stable labels (agent-01, skill-03) in place of authored names
+ * Never emitted: environment values (outside a short allowlist of non-sensitive
+ * Claude Code variables), hook or status-line command text, MCP URLs and
+ * hostnames, permission rule arguments, other projects' paths.
  *
- * Descriptions ARE emitted. They are authored prose whose whole purpose is to be
- * read by a model for routing, and hiding them would defeat the tool. This is a
- * deliberate, documented exception — not an oversight.
+ * Authored NAMES, DESCRIPTIONS and rule HEADINGS are free-form text the user
+ * wrote, so they can contain anything and no scan can vet them. They require
+ * --include-prose, which makes the output readable but no longer share-safe
+ * without review. --include-values additionally disables the allowlist.
  *
- * Zero dependencies. Read-only, except for the opt-in --probe-hooks mode, which
- * executes the user's own PreToolUse hooks against synthetic input in order to
- * verify (rather than assume) that a guard actually blocks.
+ * Zero dependencies. Read-only: it never writes, and never executes any command
+ * from the configuration it reads.
  *
  * Usage:
  *   node scan-harness.mjs [--pretty] [--root <dir>] [--project <dir>]
- *                         [--include-values] [--probe-hooks]
+ *                         [--include-prose] [--include-values]
  */
 
 import { readFileSync, readdirSync, existsSync, lstatSync, statSync, realpathSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { join, basename, dirname, extname, relative, sep, isAbsolute } from 'node:path';
 
 const SCHEMA_VERSION = 2;
@@ -49,19 +45,18 @@ const MAX_DIR_ENTRIES = 2000;   // per readdir
 const MAX_WALK_DIRS = 5000;     // global: directories entered in one walk
 const MAX_WALK_ENTRIES = 50000; // global: entries examined in one walk
 const MAX_WALK_DEPTH = 3;
-const PROBE_TIMEOUT_MS = 2000;
 
 // ---------------------------------------------------------------------------
 // args
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const opts = { pretty: false, includeValues: false, probeHooks: false, root: null, project: null };
+  const opts = { pretty: false, includeValues: false, includeProse: false, root: null, project: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--pretty') opts.pretty = true;
     else if (a === '--include-values') opts.includeValues = true;
-    else if (a === '--probe-hooks') opts.probeHooks = true;
+    else if (a === '--include-prose') opts.includeProse = true;
     else if (a === '--json') opts.pretty = false;
     else if (a === '--root') opts.root = argv[++i];
     else if (a === '--project') opts.project = argv[++i];
@@ -75,9 +70,8 @@ const HELP = `scan-harness — emit a JSON map of a Claude Code harness config
   --pretty           indent the JSON output
   --root <dir>       config root to scan (default: ~/.claude)
   --project <dir>    project dir containing .claude/, CLAUDE.md and .mcp.json
-  --probe-hooks      EXECUTE this machine's PreToolUse hooks against synthetic
-                     input to verify a guard actually blocks. Runs the user's own
-                     shell commands: off by default, opt in deliberately.
+  --include-prose    include authored names, descriptions and headings
+                     (readable, but no longer safe to share unreviewed)
   --include-values   emit raw values (UNSAFE TO SHARE)
   --help             show this message
 `;
@@ -209,14 +203,11 @@ function envValue(key, value) {
 function describeCommand(cmd) {
   if (typeof cmd !== 'string' || !cmd.trim()) return null;
   if (!REDACT) return { raw: cmd };
-  const firstWord = cmd.trim().split(/\s+/)[0] ?? '';
-  const exe = basename(firstWord.replace(/[;&|(){}'"]/g, '')) || null;
-  const scriptAbs = cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/)?.[0] ?? null;
-  return {
-    exe: ident(exe, 40),
-    script: scriptAbs ? basename(scriptAbs) : null,
-    length: cmd.length,
-  };
+  // No substring of the command is emitted by default. Parsing out an
+  // "executable" leaked `API_TOKEN=sk-live-...` from `API_TOKEN=... node x.js`,
+  // and shell assignment prefixes, `env` wrappers and quoting make a correct
+  // parse unreliable. Only the shape is reported.
+  return { type: 'command', length: cmd.length };
 }
 
 /** URLs collapse to scheme + host. Userinfo, path, query and fragment are dropped. */
@@ -459,131 +450,12 @@ function scanHooks(settingsFiles) {
     }
   }
 
-  // Two static defects that silently disable a guard. Both are computed from the
-  // full command text, which never leaves this function.
-  //
-  // 1. $TOOL_INPUT — Claude Code delivers hook data as JSON on STDIN. There is no
-  //    such environment variable, so a hook reading it inspects an empty string
-  //    and never matches. A stdin read anywhere in the command clears the flag.
-  // 2. exit 1 — only exit 2 blocks a PreToolUse call. Exit 1 is a NON-blocking
-  //    error: Claude Code logs it and runs the tool anyway.
-  const defects = { readsToolInputEnv: [], nonBlockingExit: [] };
-  const inspect = (event, matcher, command, scriptPath) => {
-    const label = scriptPath ? basename(scriptPath) : `${event}[${matcher || 'all'}] inline`;
-    let text = command;
-    if (scriptPath && existsSync(scriptPath)) text += '\n' + (readTextBounded(scriptPath) ?? '');
-    const usesEnv = /\$\{?TOOL_INPUT|\$\{?CLAUDE_TOOL_INPUT/.test(text);
-    // `echo "$TOOL_INPUT" | python3 -c '...sys.stdin...'` READS stdin, but the
-    // stdin it reads is the pipe carrying an empty variable — not the hook event.
-    // Treating that as a stdin fallback masked two genuinely broken guards.
-    const pipesEnv = /(?:echo|printf|cat)[^|\n]*\$\{?(?:CLAUDE_)?TOOL_INPUT[^|\n]*\|/.test(text);
-    const readsStdin = /\bcat\b|sys\.stdin|process\.stdin|read -r|readFileSync\(0|\/dev\/stdin/.test(text);
-    if (usesEnv && (pipesEnv || !readsStdin)) defects.readsToolInputEnv.push(ident(label, 60));
-    if (event === 'PreToolUse' && /\bexit\s+1\b/.test(text) && !/\bexit\s+2\b/.test(text)) {
-      defects.nonBlockingExit.push(ident(label, 60));
-    }
-  };
-  for (const { data } of settingsFiles) {
-    for (const [event, entries] of Object.entries(data?.hooks ?? {})) {
-      if (!Array.isArray(entries)) continue;
-      for (const e of entries) for (const h of e?.hooks ?? []) {
-        if (!h?.command) continue;
-        const cmd = String(h.command);
-        const script = cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/)?.[0] ?? null;
-        inspect(event, e?.matcher, cmd, script);
-      }
-    }
-  }
-
   return ok(items, {
     byEvent,
     events: Object.keys(byEvent).sort(),
     scriptRefs,
-    defects,
     missingTimeout: items.filter((h) => h.timeout == null).length,
   });
-}
-
-/**
- * Execute this machine's PreToolUse hooks against synthetic tool input to learn
- * whether a guard actually blocks. Opt-in only.
- *
- * Pattern-matching a hook's command text cannot establish this: a hook reading
- * `echo 'rm -rf, drop table' >/dev/null; exit 0` matches every guard pattern and
- * blocks nothing. Only running it and observing the exit status is proof.
- *
- * Rails: 2s timeout, throwaway cwd, minimal environment, no stdio inheritance,
- * and HARNESS_MAP_PROBE=1 so a hook can detect a probe and no-op.
- */
-const PROBE_COMMANDS = {
-  'rm -rf': 'rm -rf /tmp/harness-map-probe-target',
-  'drop table': 'psql -c "drop table users"',
-  'drop database': 'psql -c "drop database production"',
-  'reset --hard': 'git reset --hard HEAD~5',
-  'force push': 'git push --force origin main',
-};
-
-function probeHooks(settingsFiles) {
-  const results = {};
-  const cwd = tmpdir();
-  const commands = [];
-  for (const { data } of settingsFiles) {
-    for (const e of data?.hooks?.PreToolUse ?? []) {
-      const matcher = e?.matcher ?? '';
-      if (matcher && !/bash/i.test(matcher)) continue; // only Bash-facing guards
-      for (const h of e?.hooks ?? []) if (h?.type === 'command' && h?.command) commands.push(String(h.command));
-    }
-  }
-
-  for (const [pattern, synthetic] of Object.entries(PROBE_COMMANDS)) {
-    // The documented PreToolUse event shape. The command lives at
-    // tool_input.command, NOT at the top level.
-    const event = JSON.stringify({
-      session_id: 'harness-map-probe',
-      hook_event_name: 'PreToolUse',
-      cwd,
-      tool_name: 'Bash',
-      tool_use_id: 'harness-map-probe',
-      tool_input: { command: synthetic, description: 'harness-map verification probe' },
-    });
-
-    let blocked = false;
-    let ran = 0;
-    let errored = 0;
-    for (const command of commands) {
-      try {
-        const r = spawnSync('sh', ['-c', command], {
-          cwd,
-          timeout: PROBE_TIMEOUT_MS,
-          input: event, // hooks read their event as JSON on stdin
-          stdio: ['pipe', 'pipe', 'pipe'],
-          encoding: 'utf8',
-          env: {
-            PATH: process.env.PATH ?? '/usr/bin:/bin',
-            HOME: process.env.HOME ?? HOME,
-            HARNESS_MAP_PROBE: '1',
-          },
-        });
-        ran++;
-        // ONLY exit 2 blocks. Exit 1 (or any other non-zero) is a non-blocking
-        // hook error and the tool call proceeds — counting it as "blocked" was a
-        // false PASS that reported broken guards as working.
-        if (r.status === 2) { blocked = true; continue; }
-        if (r.status === 0) {
-          // A hook may instead deny via structured JSON on stdout, exiting 0.
-          try {
-            const out = JSON.parse(String(r.stdout ?? '').trim() || '{}');
-            const decision = out?.hookSpecificOutput?.permissionDecision ?? out?.decision;
-            if (decision === 'deny') blocked = true;
-          } catch { /* not structured output; exit 0 means allow */ }
-          continue;
-        }
-        errored++;
-      } catch { errored++; }
-    }
-    results[pattern] = { blocked, hooksRun: ran, hooksErrored: errored };
-  }
-  return { probed: true, hookCount: commands.length, results };
 }
 
 function scanCommands(roots) {
@@ -910,6 +782,135 @@ function scanProseLayer(kind, { skills, commands, agents, rules }) {
 }
 
 // ---------------------------------------------------------------------------
+// prose pass — applied ONCE, immediately before serialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Names, descriptions and headings are text the user wrote by hand, so they can
+ * contain anything: a token, a customer, an internal hostname, an incident. No
+ * scan of that text can be trusted to find every such case, so by default they
+ * are replaced with stable opaque labels and the default document is share-safe
+ * by construction rather than by inspection.
+ *
+ * `--include-prose` puts the real text back for local reading. Scanning always
+ * runs on the REAL names (orchestrator/reviewer detection depends on them); only
+ * the emitted document is relabelled.
+ */
+function applyProsePolicy(doc, includeProse) {
+  if (includeProse) return doc;
+  const pad = (i) => String(i + 1).padStart(2, '0');
+  const relabel = (layer, kind) => {
+    if (!Array.isArray(layer?.items)) return new Map();
+    const map = new Map();
+    layer.items.forEach((it, i) => {
+      if (typeof it.name !== 'string') return;
+      const label = `${kind}-${pad(i)}`;
+      map.set(it.name, label);
+      it.name = label;
+      if ('description' in it) it.description = null;
+      if ('tools' in it) it.tools = null;
+      // The filename carries the same name — keep the directory, drop the leaf.
+      // Keep only scope + top-level directory: a nested path such as
+      // `user:commands/codex/design-review.md` names the vendor in the directory.
+      if (typeof it.file === 'string') {
+        const m = it.file.match(/^([^:]*:)?([^/]+)\//);
+        it.file = m ? `${m[1] ?? ''}${m[2]}/${label}${extname(it.file)}` : `${label}${extname(it.file)}`;
+      }
+    });
+    return map;
+  };
+
+  const L = doc.layers ?? {};
+  const agentNames = relabel(L.agents, 'agent');
+  const skillNames = relabel(L.skills, 'skill');
+  const commandNames = relabel(L.commands, 'command');
+  relabel(L.mcp, 'mcp');
+  relabel(L.plugins, 'plugin');
+
+  // Aggregates that repeat a name must be relabelled too, or the mapping leaks.
+  const remap = (arr, m) => (Array.isArray(arr) ? arr.map((n) => m.get(n) ?? n) : arr);
+  if (L.agents?.status === 'ok') {
+    L.agents.bareInherit = remap(L.agents.bareInherit, agentNames);
+    L.agents.unpinned = remap(L.agents.unpinned, agentNames);
+    L.agents.parseWarnings = (L.agents.parseWarnings ?? []).map((w) => ({ file: '<file>', warnings: w.warnings }));
+  }
+  if (L.skills?.status === 'ok') {
+    L.skills.parseWarnings = (L.skills.parseWarnings ?? []).map((w) => ({ file: '<file>', warnings: w.warnings }));
+  }
+  if (L.plugins?.status === 'ok') {
+    L.plugins.disabled = (L.plugins.disabled ?? []).map(() => '<plugin>');
+    // A marketplace name is authored too (`staqs`), and it appears on every
+    // plugin item as well as in the marketplaces list.
+    const mkt = new Map();
+    (L.plugins.marketplaces ?? []).forEach((m, i) => mkt.set(m.name, `marketplace-${pad(i)}`));
+    L.plugins.marketplaces = (L.plugins.marketplaces ?? []).map((m) => ({ ...m, name: mkt.get(m.name), repo: null }));
+    for (const p of L.plugins.items) {
+      if (p.marketplace) p.marketplace = mkt.get(p.marketplace) ?? '<marketplace>';
+      if (p.version) p.version = null; // a git sha identifies the source repo
+    }
+  }
+  if (L.mcp?.status === 'ok') {
+    for (const m of L.mcp.items) {
+      if ('plugin' in m) m.plugin = m.plugin ? '<plugin>' : m.plugin;
+      if ('command' in m) m.command = null;
+      m.envKeys = (m.envKeys ?? []).map((_, i) => `env-${pad(i)}`);
+    }
+  }
+  if (L.rules?.status === 'ok') {
+    L.rules.items.forEach((r, i) => {
+      r.headingCount = Array.isArray(r.headings) ? r.headings.length : 0;
+      r.headings = [];
+      // Rule filenames are the routing vocabulary; keep the well-known ones only.
+      if (!/^(CLAUDE\.md|agent-routing|safety|verifier-protocol|context-hygiene|git-conventions)$/.test(r.name)) {
+        r.name = `rule-${pad(i)}`;
+      }
+      r.file = '<file>';
+    });
+  }
+  // Prose layers list detections by name.
+  for (const key of ['orchestrators', 'review']) {
+    const layer = L[key];
+    if (layer?.status !== 'ok') continue;
+    layer.items = (layer.items ?? []).map((it) => ({
+      kind: it.kind,
+      name: (it.kind === 'agent' ? agentNames.get(it.name)
+        : it.kind === 'skill' ? skillNames.get(it.name)
+          : commandNames.get(it.name)) ?? '<detected>',
+    }));
+    layer.proseRefs = (layer.proseRefs ?? []).map((r) => ({ name: r.name, file: '<file>', headings: [] }));
+  }
+  // Hook matchers are user-written; keep only simple tool-name forms.
+  if (L.hooks?.status === 'ok') {
+    for (const h of L.hooks.items) {
+      if (typeof h.matcher === 'string' && !/^[A-Za-z0-9_|*().-]{0,60}$/.test(h.matcher)) h.matcher = '<custom>';
+    }
+    L.hooks.scriptRefs = (L.hooks.scriptRefs ?? []).map((r, i) => ({ path: '<file>', name: `script-${pad(i)}`, exists: r.exists }));
+  }
+  if (L.environment?.status === 'ok') {
+    const env = {};
+    let i = 0;
+    for (const [k, v] of Object.entries(L.environment.env ?? {})) {
+      if (SAFE_ENV_VALUES.has(k)) env[k] = v; else env[`env-${pad(i++)}`] = v;
+    }
+    L.environment.env = env;
+    if (L.environment.statusLine?.script) L.environment.statusLine.script.name = '<script>';
+    // An MCP tool identifier carries its server name (mcp__ideabrowser__…), so
+    // only Claude Code's built-in tool names survive; the rest aggregate.
+    const BUILTIN = new Set(['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Task', 'Agent',
+      'WebFetch', 'WebSearch', 'NotebookEdit', 'TodoWrite', 'Artifact', 'Skill', 'ToolSearch']);
+    const tb = {};
+    let mcpTools = 0;
+    for (const [tool, n] of Object.entries(L.environment.permissions?.toolBreakdown ?? {})) {
+      if (BUILTIN.has(tool)) tb[tool] = n; else mcpTools += n;
+    }
+    if (mcpTools) tb['(mcp tools)'] = mcpTools;
+    if (L.environment.permissions) L.environment.permissions.toolBreakdown = tb;
+  }
+  doc.settingsFiles = (doc.settingsFiles ?? []).map((f) => ({ scope: f.scope, file: f.file }));
+  return doc;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -932,16 +933,12 @@ function main() {
   const rules = layer(() => scanRules(roots), 'rules');
   const hooks = layer(() => scanHooks(settingsFiles), 'hooks');
 
-  if (opts.probeHooks && hooks.status === 'ok') {
-    try { hooks.probe = probeHooks(settingsFiles); }
-    catch (e) { hooks.probe = { probed: false, reason: e.message }; }
-  }
 
   const doc = {
     schemaVersion: SCHEMA_VERSION,
     tool: 'harness-map',
     redacted: REDACT,
-    hooksProbed: Boolean(opts.probeHooks),
+    prose: Boolean(opts.includeProse),
     sources: roots.map((r) => ({ scope: r.label, path: pathOf(r.dir), exists: isDir(r.dir) })),
     settingsFiles: settingsFiles.map((s) => ({ scope: s.scope, file: s.file })),
     layers: {
@@ -958,6 +955,7 @@ function main() {
     },
   };
 
+  applyProsePolicy(doc, opts.includeProse || !REDACT);
   process.stdout.write(JSON.stringify(doc, null, opts.pretty ? 2 : 0) + '\n');
   return 0;
 }
