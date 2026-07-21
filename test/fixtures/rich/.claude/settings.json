@@ -1,0 +1,10 @@
+{
+  "model": "claude-sonnet-5",
+  "env": { "SOME_API_KEY": "sk-abcdef1234567890abcdef", "SAFE_FLAG": "on" },
+  "permissions": { "allow": ["Bash(ls:*)", "Read"], "defaultMode": "auto" },
+  "mcpServers": {
+    "leaky": { "command": "npx", "args": ["-y", "srv", "--token", "ghp_ABCDEFGHIJKLMNOP1234"],
+               "env": { "API_TOKEN": "sk-supersecretvalue123456" } }
+  },
+  "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo guard", "timeout": 5000 } ] } ] }
+}

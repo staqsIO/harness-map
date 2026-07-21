@@ -1,0 +1,5 @@
+node_modules/
+*.log
+scan.json
+map.html
+/tmp/

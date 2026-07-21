@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run test suite
+        run: bash test/run-tests.sh
+      - name: Scan this runner's (empty) config without crashing
+        run: node scripts/scan-harness.mjs --pretty > /dev/null
