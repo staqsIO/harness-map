@@ -394,6 +394,20 @@ node "$RENDER" --scan "$TMP/r4.json" --audit "$TMP/hostile2.json" \
 check "$([ -s "$TMP/hostile2.html" ] && echo true || echo false)" \
       "renderer survives audit.findings and audit.passing as strings"
 
+# note() is a CLOSED SET, which makes it airtight but creates a maintenance
+# hazard: a reason string added to the scanner and not to KNOWN_NOTES is silently
+# nulled, and an unconfigured layer with no reason explains nothing. Every fixture
+# is checked, because each one leaves a different set of layers unconfigured.
+echo "[reason coverage]"
+for FX in minimal rich yaml symlink prec; do
+  node "$SCAN" --root "$ROOT/test/fixtures/$FX/.claude" > "$TMP/reason-$FX.json" 2>/dev/null
+  check "$(j "$TMP/reason-$FX.json" "all(v.get('reason') is not None for v in d['layers'].values() if v.get('status')!='ok')")" \
+        "every unconfigured layer still carries a reason ($FX)"
+done
+node "$SCAN" > "$TMP/reason-self.json" 2>/dev/null
+check "$(j "$TMP/reason-self.json" "all(v.get('reason') is not None for v in d['layers'].values() if v.get('status')!='ok')")" \
+      "every unconfigured layer still carries a reason (this machine)"
+
 # A proseRef names a file the model is told it may read, so its label must be the
 # SAME label that file carries in the rules layer. The two lists were indexed
 # independently, so `rule-03` named one file in rules.items and a different one in

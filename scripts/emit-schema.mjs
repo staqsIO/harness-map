@@ -42,7 +42,7 @@ const PLACEHOLDERS = new Set([
   '<external path>', '(all)', '(mcp tools)', '(unset)', '(unrecognized)', '(other)',
 ]);
 // agent-01, skill-12, mcp-03, plugin-01, rule-02, script-05, env-04
-const GENERATED_LABEL = /^(?:agent|skill|command|mcp|plugin|marketplace|rule|script|env)-\d{1,4}$/;
+const GENERATED_LABEL = /^(?:agent|skill|command|mcp|plugin|marketplace|rule|script|env)-\d{1,6}$/;
 // Filenames Claude Code itself defines. These are not authored by the user, and
 // consumers match on them: the audit's CLAUDE.md check compares by name, so
 // collapsing this to a placeholder made it report "no CLAUDE.md found" on a
@@ -52,7 +52,19 @@ const PUBLISHED_NAMES = new Set([
   'context-hygiene', 'git-conventions',
 ]);
 // `user:agents/foo.md` — a scope prefix plus a path relative to a scanned root.
-const RELATIVE_PATH = /^(?:user|project|local|plugin):[\w.\-/@ ]{0,120}$/;
+// In default mode the prose policy has already reduced every path to one of four
+// GENERATED shapes, so the emitter accepts exactly those rather than a permissive
+// character class. An earlier form allowed 120 arbitrary characters after `user:`
+// and did not even require a slash, so `user:ACME_INTERNAL_TOKEN` satisfied it —
+// and a single authored segment is structurally indistinguishable from a real
+// single-segment filename, which is why this enumerates instead.
+const CONFIG_ROOTS = 'agents|commands|skills|rules|hooks|scripts|plugins';
+const CONFIG_FILES = 'settings\\.json|settings\\.local\\.json|\\.mcp\\.json|CLAUDE\\.md|CLAUDE\\.local\\.md';
+const RELATIVE_PATH = new RegExp(
+  '^(?:user|project|local|plugin):'
+  + `(?:\\.|${CONFIG_FILES}`
+  + `|(?:${CONFIG_ROOTS})\\/(?:agent|command|skill|rule|script|plugin)-\\d{1,6}\\.[a-z]{1,5})$`,
+);
 
 // Published Claude Code vocabulary. These are NOT authored by the user: they are
 // names Anthropic defines, so they may appear verbatim as map keys and enums.
@@ -71,11 +83,40 @@ const ENV_KEYS = new Set([
   'MAX_THINKING_TOKENS', 'DISABLE_TELEMETRY', 'DISABLE_COST_WARNINGS',
 ]);
 
-// The one sentence the MCP layer attaches about server-side connectors.
+// Every string this tool can put in a note position, enumerated. Reasons and
+// warnings are GENERATED here, so the set is finite and can be listed — which is
+// stronger than any character-class test. A charset check passed 200 characters of
+// authored text, and node:fs error messages embed the absolute path that failed.
+const LAYERS = ['agents', 'hooks', 'environment', 'commands', 'skills', 'plugins', 'mcp', 'rules'];
 const KNOWN_NOTES = new Set([
+  'harness-map',
   'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned'
   + ' server-side and cannot be detected from configuration files.',
+  // unconfigured reasons
+  'no agents/*.md with frontmatter found',
+  'no commands/*.md found',
+  'no hooks configured in settings.json',
+  'no installed plugins or marketplaces found',
+  'no rules/*.md or CLAUDE.md found',
+  'no skills/*/SKILL.md found',
+  'no MCP servers found in settings, claude.json, or plugins',
+  'no model/env/permissions/statusLine in settings',
+  'no orchestrator skills/commands and no routing rules found — Claude Code built-in defaults apply',
+  'no reviewer agents/commands and no review or verifier rules found',
+  // frontmatter rejections, AFTER stripKey has removed the authored key
+  'anchor/alias/tag unsupported',
+  'duplicate key',
+  'escape sequences unsupported',
+  'flow collection unsupported',
+  'indentation indicator unsupported',
+  'indented line outside a nested value',
+  'unparseable line',
+  'unterminated double quote',
+  'unterminated single quote',
+  'non-scalar value',
 ]);
+// `failed to scan <layer> (<CODE>)` — the layer is ours, the code is an fs errno.
+const SCAN_ERROR = new RegExp(`^failed to scan (?:${LAYERS.join('|')}) \\([A-Z_]{1,20}|unknown error\\)$`);
 
 // --- emitters --------------------------------------------------------------
 // Each returns a value of a shape that cannot carry free-form text, EXCEPT text(),
@@ -113,8 +154,10 @@ const modelName = (v) => {
   // A published model id is dashed and lowercase (claude-opus-4-8, optionally
   // with a [1m] context suffix). `claudeAcmeSecret` is not a model id, and the
   // previous `claude` prefix test passed it verbatim.
+  // Published ids are lowercase and short. The case-insensitive, unbounded form
+  // accepted CLAUDE-ACME-SECRET and arbitrarily long claude- payloads.
   return /^(?:opus|sonnet|haiku|fable|inherit|opusplan|default)$/.test(s)
-    || /^claude-[a-z0-9]+(?:[-.][a-z0-9]+)*(?:\[[a-z0-9]{1,6}\])?$/i.test(s)
+    || (s.length <= 40 && /^claude-[a-z0-9]+(?:[-.][a-z0-9]+){0,6}(?:\[[a-z0-9]{1,6}\])?$/.test(s))
     || PLACEHOLDERS.has(s)
     ? s
     : CUSTOM;
@@ -146,12 +189,7 @@ const note = (v) => {
   // --include-prose is the mode where authored text is allowed through; a warning
   // that names the offending key is exactly the detail it exists to provide.
   if (PROSE) return s;
-  if (KNOWN_NOTES.has(s)) return s;
-  // Generated messages quote the offending key ("duplicate key 'Acme-Secret'"),
-  // and that key is authored. A quoted segment is therefore never allowed here,
-  // whatever produced it — the message carries the reason, not the identifier.
-  if (/['"`]/.test(s)) return null;
-  return /^[A-Za-z0-9 ,.;:()/\-<>$]{0,200}$/.test(s) ? s : null;
+  return KNOWN_NOTES.has(s) || SCAN_ERROR.test(s) ? s : null;
 };
 
 /** A key drawn from published Claude Code vocabulary, else an opaque label. */

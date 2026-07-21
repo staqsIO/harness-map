@@ -455,7 +455,14 @@ const unconfigured = (reason, extra = {}) => ({ status: 'unconfigured', count: 0
 
 function layer(fn, label) {
   try { return fn(); }
-  catch (err) { return { status: 'error', count: 0, items: [], reason: `failed to scan ${label}: ${err.message}` }; }
+  // err.message from node:fs embeds the absolute path that failed
+  // ("ENOENT: no such file or directory, open '/Users/...'"), so the reason names
+  // the layer and the error CODE only. The full error is a local diagnostic, not
+  // part of a document meant to be shareable.
+  catch (err) {
+    const code = typeof err?.code === 'string' && /^[A-Z_]{1,20}$/.test(err.code) ? err.code : 'unknown error';
+    return { status: 'error', count: 0, items: [], reason: `failed to scan ${label} (${code})` };
+  }
 }
 
 function collectSettings(roots) {

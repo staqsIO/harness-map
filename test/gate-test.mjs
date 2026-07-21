@@ -168,5 +168,40 @@ inherited.prose = false;
 check(em(inherited).schemaVersion === undefined,
   'a declared field inherited from the input prototype is not accepted');
 
+// --- emitters that were still loose in round 8 ------------------------------
+check(em({ layers: { agents: { status: 'ok', items: [{ file: 'user:ACME_INTERNAL_TOKEN_VALUE' }] } } })
+  .layers.agents.items[0].file === '<file>',
+  'a scope prefix followed by non-path text does not pass as a path');
+// In default mode the policy has already replaced the basename with a generated
+// label, so `user:agents/foo.md` — an authored basename — must NOT pass.
+check(em({ layers: { agents: { status: 'ok', items: [{ file: 'user:agents/agent-07.md' }] } } })
+  .layers.agents.items[0].file === 'user:agents/agent-07.md',
+  'a generated root-relative path still passes');
+check(em({ layers: { agents: { status: 'ok', items: [{ file: 'user:agents/foo.md' }] } } })
+  .layers.agents.items[0].file === '<file>',
+  'a path carrying an authored basename is replaced');
+check(em({ layers: { agents: { status: 'ok', items: [{ file: 'user:settings.json' }] } } })
+  .layers.agents.items[0].file === 'user:settings.json',
+  'a published config filename still passes');
+check(em({ layers: { environment: { status: 'ok', model: 'CLAUDE-ACME-SECRET' } } })
+  .layers.environment.model === '<custom>',
+  'an uppercase claude-prefixed string is not treated as a model id');
+check(em({ layers: { agents: { status: 'ok', reason: 'ACME internal note about a customer' } } })
+  .layers.agents.reason === null,
+  'note is a closed set: arbitrary quote-free prose does not pass');
+check(em({ layers: { agents: { status: 'unconfigured', reason: 'no agents/*.md with frontmatter found' } } })
+  .layers.agents.reason === 'no agents/*.md with frontmatter found',
+  'a reason this tool generates does pass');
+check(em({ layers: { agents: { status: 'error', reason: 'failed to scan agents (EACCES)' } } })
+  .layers.agents.reason === 'failed to scan agents (EACCES)',
+  'a scan error carries the layer and errno');
+check(em({ layers: { agents: { status: 'error',
+  reason: "failed to scan agents: ENOENT: no such file or directory, open /Users/me/secret" } } })
+  .layers.agents.reason === null,
+  'an fs error message carrying an absolute path is withheld');
+check(em({ layers: { agents: { status: 'ok', items: [{ name: 'agent-10000' }] } } })
+  .layers.agents.items[0].name === 'agent-10000',
+  'a generated label past four digits is still recognised');
+
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
