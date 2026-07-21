@@ -41,6 +41,10 @@ check "$(j "$TMP/min.json" "d['layers']['rules']['status']=='ok'")" "picks up a 
 node "$RENDER" --scan "$TMP/min.json" --out "$TMP/min.html" 2>/dev/null
 check "$([ -s "$TMP/min.html" ] && echo true || echo false)" "renderer produces output for an empty config"
 check "$(grep -q 'class="empty"' "$TMP/min.html" && echo true || echo false)" "renders empty states"
+# Opened as a standalone file there is no HTTP charset header and no wrapper
+# <head>, so without this every em dash rendered as mojibake.
+check "$(head -c 200 "$TMP/min.html" | grep -qi 'charset=.utf-8' && echo true || echo false)" \
+      "declares utf-8 within the first bytes so standalone output is not mojibake"
 check "$(grep -q 'built-in defaults apply' "$TMP/min.html" && echo true || echo false)" "explains the built-in fallback"
 
 # --- 2. redaction ------------------------------------------------------------

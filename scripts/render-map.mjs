@@ -475,7 +475,14 @@ const summaryChips = [
 const firstOk = TABS.findIndex((t) => statusOf(t.layer) === 'ok');
 const activeIdx = firstOk === -1 ? 0 : firstOk;
 
-const html = `<title>Harness Map</title>
+// The page is emitted as head+body content, because the Artifact tool wraps it in
+// its own document skeleton. Opened as a standalone file, though, there is no
+// skeleton and no HTTP charset header, so the browser guesses the encoding and
+// renders every em dash as mojibake. The declaration has to be in the first 1024
+// bytes to take effect, so it goes first.
+const html = `<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness Map</title>
 <style>
 :root{
   --bg:#F4F5F3; --surface:#FFFFFF; --surface-2:#EDEFEC; --line:#DCDFDA;
