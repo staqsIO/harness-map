@@ -1,0 +1,5 @@
+---
+name: nullmodel
+model:
+---
+x

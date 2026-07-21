@@ -2,12 +2,14 @@
   "model": "claude-sonnet-5",
   "env": {
     "SOME_API_KEY": "sk-abcdef1234567890abcdef",
-    "SAFE_FLAG": "on"
+    "SERVICE_URL": "postgres://admin:hunter2@db.internal/private",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "475000"
   },
   "permissions": {
     "allow": [
-      "Bash(ls:*)",
-      "Read"
+      "Bash cat /Users/alice/.ssh/id_rsa",
+      "Read(*)",
+      "Bash(ls:*)"
     ],
     "defaultMode": "auto"
   },
@@ -22,7 +24,9 @@
       ],
       "env": {
         "API_TOKEN": "sk-supersecretvalue123456"
-      }
+      },
+      "url": "https://alice:hunter2@example.com/mcp/acct/550e8400?safe=1",
+      "type": "http"
     }
   },
   "hooks": {
@@ -41,5 +45,9 @@
   },
   "enabledPlugins": {
     "somekit@somekit": false
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "client --session 550e8400-e29b-41d4-a716-446655440000"
   }
 }

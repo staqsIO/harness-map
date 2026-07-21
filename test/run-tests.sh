@@ -7,6 +7,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCAN="$ROOT/scripts/scan-harness.mjs"
 RENDER="$ROOT/scripts/render-map.mjs"
+AUDIT="$ROOT/scripts/audit-harness.mjs"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -30,7 +31,7 @@ node "$SCAN" --root "$ROOT/test/fixtures/minimal/.claude" \
              --project "$ROOT/test/fixtures/minimal" > "$TMP/min.json" 2>"$TMP/min.err"
 check "$([ $? -eq 0 ] && echo true || echo false)" "scanner exits 0 with no .claude dir"
 check "$([ ! -s "$TMP/min.err" ] && echo true || echo false)" "scanner writes nothing to stderr"
-check "$(j "$TMP/min.json" "d['schemaVersion']==1")" "emits schemaVersion 1"
+check "$(j "$TMP/min.json" "d['schemaVersion']==2")" "emits schemaVersion 2"
 for layer in agents orchestrators review; do
   check "$(j "$TMP/min.json" "d['layers']['$layer']['status']=='unconfigured'")" \
         "layer '$layer' is unconfigured (not fabricated)"
@@ -43,27 +44,98 @@ check "$(grep -q 'class="empty"' "$TMP/min.html" && echo true || echo false)" "r
 check "$(grep -q 'built-in defaults apply' "$TMP/min.html" && echo true || echo false)" "explains the built-in fallback"
 
 # --- 2. redaction ------------------------------------------------------------
+# The privacy contract is an ALLOWLIST: only structurally safe shapes are
+# emitted. These fixtures plant credentials in shapes a blocklist cannot catch —
+# an ordinary key name with a credential value, a token inside a command, URL
+# userinfo, a permission rule with no parenthesis, a path outside $HOME. Every
+# one of these leaked in an earlier build while the old tests passed.
 echo "[redaction]"
 node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" > "$TMP/rich.json"
-LEAK="$(grep -oE 'sk-[A-Za-z0-9]{6,}|ghp_[A-Za-z0-9]{10,}|supersecret' "$TMP/rich.json" | sort -u)"
-check "$([ -z "$LEAK" ] && echo true || echo false)" "planted secrets are redacted by default"
+LEAK="$(grep -oE 'sk-[A-Za-z0-9]{6,}|ghp_[A-Za-z0-9]{10,}|supersecret|hunter2|id_rsa|550e8400|postgres://' "$TMP/rich.json" | sort -u)"
+check "$([ -z "$LEAK" ] && echo true || echo false)" "no planted credential appears in output"
 [ -n "$LEAK" ] && printf '        leaked: %s\n' "$LEAK"
-check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SOME_API_KEY']=='<redacted>'")" "secret-shaped env keys are masked"
-check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SAFE_FLAG']=='on'")" "non-secret env values are preserved"
-check "$(j "$TMP/rich.json" "d['layers']['mcp']['items'][0]['envKeys']==['API_TOKEN']")" "MCP env keys kept, values dropped"
+check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SOME_API_KEY']=='<hidden>'")" "secret-shaped env key: value hidden"
+check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['SERVICE_URL']=='<hidden>'")" \
+      "ORDINARY env key with a credential value is hidden (blocklist could not catch this)"
+check "$(j "$TMP/rich.json" "d['layers']['environment']['env']['CLAUDE_CODE_AUTO_COMPACT_WINDOW']=='475000'")" \
+      "allowlisted non-sensitive env value still emitted"
+check "$(j "$TMP/rich.json" "any(m['name']=='leaky' and m['envKeys']==['API_TOKEN'] for m in d['layers']['mcp']['items'])")" "MCP env keys kept, values dropped"
+check "$(j "$TMP/rich.json" "all(m['url'] in (None,'https://example.com') for m in d['layers']['mcp']['items'])")" \
+      "MCP url collapses to scheme+host (userinfo and path dropped)"
+check "$(j "$TMP/rich.json" "d['layers']['environment']['permissions']['unrecognized']>=1")" \
+      "permission rule without a tool grammar becomes (unrecognized), not echoed"
+check "$(j "$TMP/rich.json" "all('preview' not in (h.get('command') or {}) for h in d['layers']['hooks']['items'])")" \
+      "hook commands are described, never quoted"
+check "$(! grep -qE '\"(/|[A-Za-z]:\\\\)' "$TMP/rich.json" && echo true || echo false)" \
+      "no absolute path is emitted anywhere"
 
 node "$SCAN" --root "$ROOT/test/fixtures/rich/.claude" --include-values > "$TMP/raw.json"
-check "$(grep -qE 'sk-supersecret|ghp_ABCDEF' "$TMP/raw.json" && echo true || echo false)" "--include-values opts out of redaction"
+check "$(grep -qE 'hunter2|supersecret' "$TMP/raw.json" && echo true || echo false)" "--include-values opts out of redaction"
+
+# --- 2c. safety checks must not claim what they cannot prove ------------------
+# A hook that matches every guard pattern but exits 0 blocks nothing.
+echo "[safety claims]"
+node "$SCAN" --root "$ROOT/test/fixtures/donothing/.claude" > "$TMP/dn.json"
+node "$AUDIT" --scan "$TMP/dn.json" --json > "$TMP/dn-audit.json" 2>/dev/null
+check "$(j "$TMP/dn-audit.json" "not any(p['id'].startswith('safety.blocks') for p in d['passing'])")" \
+      "no safety guard PASSES without probe evidence"
+check "$(j "$TMP/dn-audit.json" "any(f['id']=='safety.behaviour-verified' for f in d['findings'])")" \
+      "unverified guards are reported as such"
+node "$SCAN" --root "$ROOT/test/fixtures/donothing/.claude" --probe-hooks > "$TMP/dn-probe.json"
+node "$AUDIT" --scan "$TMP/dn-probe.json" --json > "$TMP/dn-probe-audit.json" 2>/dev/null
+check "$(j "$TMP/dn-probe-audit.json" "not any(p['id'].startswith('safety.blocks') for p in d['passing'])")" \
+      "probing a do-nothing hook still fails every guard (no false PASS)"
+check "$(j "$TMP/dn-probe-audit.json" "sum(1 for f in d['findings'] if f['id'].startswith('safety.blocks'))>=4")" \
+      "probe reports the unguarded patterns as findings"
+
+# --- 2d. MCP precedence -------------------------------------------------------
+echo "[mcp precedence]"
+node "$SCAN" --root "$ROOT/test/fixtures/prec/.claude" --project "$ROOT/test/fixtures/prec/proj" > "$TMP/prec.json"
+check "$(j "$TMP/prec.json" "any(m['name']=='db' and m['origin']=='local' for m in d['layers']['mcp']['items'])")" \
+      "local scope wins over project and user"
+check "$(j "$TMP/prec.json" "len([m for m in d['layers']['mcp']['items'] if m['name']=='db'])==1")" \
+      "a shadowed server appears once, not repeatedly"
+check "$(j "$TMP/prec.json" "any(m['name']=='projonly' for m in d['layers']['mcp']['items'])")" \
+      "project .mcp.json is read from <project>/.mcp.json"
+
+# --- 2e. YAML strictness ------------------------------------------------------
+# The parser must refuse constructs it cannot handle exactly. A wrong value is
+# worse than a missing one, because the audit asserts on these fields.
+echo "[yaml strictness]"
+node "$SCAN" --root "$ROOT/test/fixtures/yaml/.claude" > "$TMP/yaml.json"
+check "$(j "$TMP/yaml.json" "any('indentation indicator' in w for x in d['layers']['agents']['parseWarnings'] for w in x['warnings'])")" \
+      "indentation indicator (>2-) is refused, not guessed"
+check "$(j "$TMP/yaml.json" "any('escape sequence' in w for x in d['layers']['agents']['parseWarnings'] for w in x['warnings'])")" \
+      "double-quoted escapes are refused, not emitted literally"
+check "$(j "$TMP/yaml.json" "any(a['name']=='nullmodel' and a['model'] is None for a in d['layers']['agents']['items'])")" \
+      "empty value parses as null, not empty string"
+check "$(j "$TMP/yaml.json" "any(a['name']=='folded' and '\n\n' in (a['description'] or '') for a in d['layers']['agents']['items'])")" \
+      "folded scalar preserves the paragraph break"
+
+# --- 2f. symlink containment --------------------------------------------------
+echo "[containment]"
+node "$SCAN" --root "$ROOT/test/fixtures/symlink/.claude" > "$TMP/sym.json"
+check "$(! grep -q 'SECRETMATERIAL' "$TMP/sym.json" && echo true || echo false)" \
+      "symlinked rule file contents never reach output"
+check "$(j "$TMP/sym.json" "not any(r['name']=='agent-routing' for r in d['layers']['rules'].get('items',[]))")" \
+      "symlinked rule file is not offered as a proseRef for the model to read"
 
 # --- 2b. MCP discovery across all four declaration sites ----------------------
 # Regression: an earlier build read only settings.json and undercounted 14 -> 1.
 echo "[mcp discovery]"
-check "$(j "$TMP/rich.json" "d['layers']['mcp']['count']==4")" "finds servers in all four sources"
-for pair in "leaky:settings (user)" "globalsrv:global" "projsrv:project" "pluginsrv:plugin"; do
+for pair in "leaky:settings (user)" "globalsrv:user" "pluginsrv:plugin"; do
   name="${pair%%:*}"; origin="${pair#*:}"
   check "$(j "$TMP/rich.json" "any(m['name']=='$name' and m['origin']=='$origin' for m in d['layers']['mcp']['items'])")" \
-        "discovers '$name' from origin '$origin'"
+        "discovers '$name' from scope '$origin'"
 done
+# A server belonging to some OTHER project must be counted but never emitted:
+# its config path names private repos and client work.
+check "$(j "$TMP/rich.json" "not any(m['name']=='projsrv' for m in d['layers']['mcp']['items'])")" \
+      "another project's server is not listed as loadable here"
+check "$(j "$TMP/rich.json" "d['layers']['mcp']['otherProjectServers']>=1")" \
+      "another project's servers are counted"
+check "$(! grep -q 'projA' "$TMP/rich.json" && echo true || echo false)" \
+      "other project paths are never emitted"
 check "$(j "$TMP/rich.json" "any(m['name']=='pluginsrv' and m['enabled'] is False for m in d['layers']['mcp']['items'])")" \
       "marks servers from a disabled plugin as inactive"
 check "$(j "$TMP/rich.json" "'connectors' in d['layers']['mcp'].get('caveat','').lower()")" \

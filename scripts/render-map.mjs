@@ -59,6 +59,19 @@ const esc = (s) =>
 const has = (layer) => layer?.status === 'ok';
 const statusOf = (layer) => layer?.status ?? 'unconfigured';
 
+/**
+ * Commands are described, never quoted — the scanner deliberately emits only an
+ * executable and script name, because command text carries credentials.
+ */
+function cmdLabel(c) {
+  if (!c) return '';
+  if (c.raw) return c.raw; // only present when the scan ran --include-values
+  const parts = [c.exe].filter(Boolean);
+  if (c.script && c.script !== c.exe) parts.push(c.script);
+  const label = parts.join(' → ') || 'command';
+  return c.length ? `${label}  (${c.length} chars, hidden)` : label;
+}
+
 /** Empty state: says what's missing and what would populate it. Never invents. */
 function emptyState(layer, { title, hint }) {
   const reason = layer?.reason || 'not configured';
@@ -168,7 +181,7 @@ function viewHooks() {
         <dt>Model</dt><dd class="mono">${esc(envLayer.model ?? '—')}</dd>
         <dt>Permission mode</dt><dd class="mono">${esc(perms.defaultMode ?? '—')}</dd>
         <dt>Allow rules</dt><dd class="mono">${perms.allow ?? 0}</dd>
-        ${envLayer.statusLine ? `<dt>Status line</dt><dd class="mono dim">${esc(envLayer.statusLine.command?.preview ?? '')}</dd>` : ''}
+        ${envLayer.statusLine ? `<dt>Status line</dt><dd class="mono dim">${esc(cmdLabel(envLayer.statusLine.command))}</dd>` : ''}
       </dl>
       ${Object.keys(env).length ? `<div class="scroll"><table><thead><tr><th>Env var</th><th>Value</th></tr></thead><tbody>
         ${Object.entries(env).map(([k, v]) => `<tr><td class="mono strong">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join('')}
@@ -207,8 +220,8 @@ function viewHooks() {
       <ul class="hook-list">
         ${list.map((h) => `<li class="hook">
           <span class="matcher mono">${esc(h.matcher)}</span>
-          <code class="cmd">${esc(h.command?.preview ?? '')}</code>
-          ${h.command?.script ? `<span class="tag mono">${esc(h.command.script)}</span>` : ''}
+          <code class="cmd">${esc(cmdLabel(h.command))}</code>
+          ${h.timeout ? `<span class="tag mono">${h.timeout}ms</span>` : '<span class="tag mono dim">no timeout</span>'}
         </li>`).join('')}
       </ul>
     </li>`;
@@ -307,23 +320,23 @@ function viewInventory() {
 
   const mcpOrigin = (m) => {
     if (m.origin === 'plugin') return `plugin: ${m.plugin}`;
-    if (m.origin === 'project') return `project: ${m.projectPath}`;
     return m.origin;
   };
   const mcp = inventoryBlock('MCP servers', L.mcp, (l) => `
     ${l.byOrigin ? `<div class="pills">${Object.entries(l.byOrigin).map(([o, n]) =>
       `<span class="pill"><span class="pill-kind">${esc(o)}</span><span class="pill-n">${n}</span></span>`).join('')}</div>` : ''}
-    <div class="scroll"><table><thead><tr><th>Server</th><th>Declared in</th><th>Transport</th><th>State</th></tr></thead><tbody>
+    <div class="scroll"><table><thead><tr><th>Server</th><th>Resolved from</th><th>Transport</th><th>State</th></tr></thead><tbody>
       ${l.items.map((m) => {
-        const off = m.enabled === false;
+        const off = m.active === false;
         return `<tr${off ? ' class="row-off"' : ''}>
           <td class="mono strong">${esc(m.name)}</td>
-          <td class="mono dim">${esc(mcpOrigin(m))}</td>
+          <td class="mono dim">${esc(mcpOrigin(m))}${m.shadowed?.length ? ` <span class="dim">(shadows ${esc(m.shadowed.join(', '))})</span>` : ''}</td>
           <td class="mono dim">${esc(m.transport ?? '')}</td>
-          <td>${off ? '<span class="chip neutral">disabled</span>' : '<span class="chip t-2">active</span>'}</td>
+          <td>${off ? '<span class="chip neutral">inactive</span>' : '<span class="chip t-2">active</span>'}</td>
         </tr>`;
       }).join('')}
     </tbody></table></div>
+    ${l.otherProjectServers ? `<p class="note">${l.otherProjectServers} further server(s) are configured for ${l.otherProjects} other project(s). Those paths are not shown, and those servers do not load here.</p>` : ''}
     ${l.caveat ? `<p class="note dim">${esc(l.caveat)}</p>` : ''}`);
 
   const rules = inventoryBlock('Rules & instructions', L.rules, (l) =>

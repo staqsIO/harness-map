@@ -72,19 +72,64 @@ What it asserts, and why each one is falsifiable rather than a matter of taste:
 - **Auto-compact threshold** — `CLAUDE_CODE_AUTO_COMPACT_WINDOW` fires at roughly
   **84%** of the value you set, not at the value. The audit does the arithmetic.
 
-## Privacy
+## Privacy — an allowlist, not a blocklist
 
-Output is **redacted by default**, because these pages are meant to be shared:
+These pages are meant to be shared, so the scanner emits **only structurally safe
+shapes** and nothing else:
 
-- home paths collapse to `~`
-- values under secret-shaped keys (`*_key`, `*token*`, `*secret*`) → `<redacted>`
-- MCP server args and env **values** are dropped; only key names remain
-- permission rules reduce to per-tool counts, never the full rule list
-- hook commands are truncated to a short preview plus the script name
+| Emitted | Never emitted |
+|---|---|
+| Names you authored (agents, skills, commands, servers, plugins) | Environment values, except a short allowlist of non-sensitive Claude Code variables |
+| Enumerations (model, transport, scope, event) | Hook and status-line **command text** |
+| Counts, booleans, timeouts | MCP URLs beyond scheme + host |
+| Paths **relative** to a scanned root | Any absolute path |
+| Rule-file headings | Permission rule arguments |
 
-`--include-values` opts out. Output produced that way must not be shared.
+An earlier version did the opposite — it emitted everything and tried to redact
+what *looked* like a secret. That cannot work, and a pre-publication review proved
+it: `SERVICE_URL=postgres://admin:pw@host` is neither a secret-shaped key nor a
+recognizable token, so it leaked verbatim. So did a session UUID inside a
+status-line command, credentials in URL userinfo, a permission rule reading
+`Bash cat ~/.ssh/id_rsa`, and any absolute path outside the current user's home.
+The set of things that look like a credential is unbounded, so the guarantee now
+comes from what is *emitted* rather than from what is caught.
+
+**Descriptions are a deliberate exception.** They are authored prose whose purpose
+is to be read for routing, and hiding them would defeat the tool.
+
+`--include-values` opts out entirely. Output produced that way must not be shared.
+
+Rule files are read for headings only, and **symlinks are never followed** out of
+the configuration tree — otherwise a symlinked `rules/*.md` could route arbitrary
+local files into a published page.
 
 The rendered page is fully self-contained: no external scripts, fonts, or images.
+
+## Verifying safety hooks (`--probe-hooks`)
+
+Whether a hook *blocks* cannot be established by reading it. A hook whose body is
+
+```sh
+echo 'rm -rf, drop table, git push --force' >/dev/null; exit 0
+```
+
+mentions every dangerous pattern and stops nothing. An earlier version matched
+command text and reported that config as fully guarded — a false sense of
+protection, which is worse than no check at all.
+
+So the safety checks require evidence:
+
+```bash
+node scripts/scan-harness.mjs --probe-hooks > scan.json
+```
+
+This **executes your own `PreToolUse` hooks** against synthetic tool input and
+records whether any exits non-zero. It is opt-in for that reason, and runs each
+hook with a 2-second timeout, a throwaway working directory, a minimal
+environment, no inherited stdio, and `HARNESS_MAP_PROBE=1` set so a hook can
+detect a probe and no-op.
+
+Without the flag, the safety checks report **unverified** — never a pass.
 
 ## Standalone use
 

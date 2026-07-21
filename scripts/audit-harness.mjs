@@ -88,21 +88,40 @@ const CHECKS = [
   },
 
   // --- safety ---------------------------------------------------------------
+  // These assert BLOCKING BEHAVIOUR, which can only be established by running the
+  // hook. An earlier version regex-matched the hook's command text; a hook whose
+  // body was `echo 'rm -rf, drop table' >/dev/null; exit 0` matched every pattern
+  // and passed every check while blocking nothing. Grepping a command proves
+  // nothing about what it does, so without probe evidence these are n/a — never a
+  // pass. A safety check that reports protection you do not have is worse than no
+  // check at all.
   ...[
-    ['rm -rf', 'safety.guard-rm-rf', 'high', 'Recursive delete is guarded by a PreToolUse hook'],
-    ['drop table', 'safety.guard-drop-table', 'high', 'DROP TABLE is guarded by a PreToolUse hook'],
-    ['drop database', 'safety.guard-drop-database', 'high', 'DROP DATABASE is guarded by a PreToolUse hook'],
-    ['reset --hard', 'safety.guard-reset-hard', 'medium', 'git reset --hard is guarded by a PreToolUse hook'],
-    ['force push', 'safety.guard-force-push', 'high', 'Force-push is guarded by a PreToolUse hook'],
-    ['secret files', 'safety.guard-secret-files', 'high', 'Writes to .env / credentials / .pem are guarded by a PreToolUse hook'],
+    ['rm -rf', 'safety.blocks-rm-rf', 'high', 'A PreToolUse hook blocks recursive delete'],
+    ['drop table', 'safety.blocks-drop-table', 'high', 'A PreToolUse hook blocks DROP TABLE'],
+    ['drop database', 'safety.blocks-drop-database', 'high', 'A PreToolUse hook blocks DROP DATABASE'],
+    ['reset --hard', 'safety.blocks-reset-hard', 'medium', 'A PreToolUse hook blocks git reset --hard'],
+    ['force push', 'safety.blocks-force-push', 'high', 'A PreToolUse hook blocks force-push'],
   ].map(([key, id, severity, title]) => ({
     id, severity, title,
-    why: 'A destructive operation blocked only by a written rule depends on the model remembering it. A PreToolUse hook cannot be forgotten.',
-    applies: () => okLayer('hooks') && L.hooks.guards && key in L.hooks.guards,
-    run: () => (L.hooks.guards[key]
-      ? { status: PASS, detail: 'a PreToolUse hook matches this pattern' }
-      : { status: FAIL, detail: 'no PreToolUse hook matches this pattern', evidence: ['settings.json → hooks.PreToolUse'] }),
+    why: 'A destructive operation prevented only by a written rule depends on the model remembering it. A hook that actually exits non-zero cannot be forgotten. Verified by executing the hook against synthetic input, because matching its text would pass a hook that blocks nothing.',
+    applies: () => okLayer('hooks') && Boolean(L.hooks.probe?.probed) && key in (L.hooks.probe.results ?? {}),
+    run: () => {
+      const r = L.hooks.probe.results[key];
+      return r.blocked
+        ? { status: PASS, detail: `a hook exited non-zero for synthetic "${key}" input (${r.hooksRun} hook(s) exercised)` }
+        : { status: FAIL, detail: `no hook blocked synthetic "${key}" input (${r.hooksRun} hook(s) exercised)`, evidence: ['settings.json → hooks.PreToolUse'] };
+    },
   })),
+  {
+    id: 'safety.behaviour-verified',
+    severity: 'medium',
+    title: 'Destructive-operation guards were verified by execution, not assumed',
+    why: 'Without --probe-hooks nothing here can assert that a guard blocks. The scan reports which patterns a hook mentions, but mentioning is not blocking.',
+    applies: () => okLayer('hooks'),
+    run: () => (L.hooks.probe?.probed
+      ? { status: PASS, detail: `${L.hooks.probe.hookCount} PreToolUse hook(s) exercised against synthetic input` }
+      : { status: FAIL, detail: 'guards unverified — re-run with --probe-hooks to establish blocking behaviour', evidence: ['scan-harness.mjs --probe-hooks'] }),
+  },
 
   // --- config integrity -----------------------------------------------------
   {
@@ -171,6 +190,20 @@ const CHECKS = [
       return bad.length
         ? { status: FAIL, detail: `${bad.length} description(s) under 40 characters`, evidence: bad.slice(0, 12) }
         : { status: PASS, detail: 'all descriptions are substantive' };
+    },
+  },
+
+  {
+    id: 'frontmatter.parseable',
+    severity: 'medium',
+    title: 'All agent and skill frontmatter uses supported YAML',
+    why: 'The parser refuses constructs it cannot handle exactly rather than guessing, so an unsupported one leaves the field empty. Without this check that shows up as a missing description instead of the unparseable frontmatter it actually is.',
+    applies: () => okLayer('agents') || okLayer('skills'),
+    run: () => {
+      const w = [...(L.agents?.parseWarnings ?? []), ...(L.skills?.parseWarnings ?? [])];
+      return w.length
+        ? { status: FAIL, detail: `${w.length} file(s) use unsupported YAML`, evidence: w.map((x) => `${x.file}: ${x.warnings.join('; ')}`) }
+        : { status: PASS, detail: 'all frontmatter parsed exactly' };
     },
   },
 

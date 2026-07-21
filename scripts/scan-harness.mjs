@@ -2,42 +2,65 @@
 /**
  * scan-harness.mjs — deterministic Claude Code harness scanner.
  *
- * Reads a Claude Code configuration (user-level ~/.claude and optionally a
- * project-level .claude) and emits a single JSON document describing the
+ * Reads a Claude Code configuration and emits a JSON document describing the
  * harness topology: agents and their model bindings, hooks, commands, skills,
  * plugins, MCP servers, and pointers to prose rule files.
  *
- * Zero dependencies. Read-only. Never throws on a malformed or missing input —
- * each layer independently degrades to {status: "unconfigured" | "error"} so a
- * minimal config produces a valid (mostly empty) document rather than a crash.
+ * PRIVACY MODEL — ALLOWLIST, NOT BLOCKLIST.
+ * An earlier version tried to redact values that "looked like" secrets. That
+ * cannot work: `SERVICE_URL=postgres://admin:pw@host` is neither a secret-shaped
+ * key nor a branded token, and it leaked verbatim. The space of things that look
+ * like a credential is unbounded, so a blocklist can never support a
+ * "safe to share" guarantee.
  *
- * Output is REDACTED by default; see redact() below. Pass --include-values to
- * emit raw values, in which case the output may contain secrets and must not
- * be shared.
+ * This version emits ONLY structurally safe shapes:
+ *   - identifiers the user authored (agent/skill/command/server/plugin names)
+ *   - enumerations (model, transport, scope, event, status)
+ *   - counts and booleans
+ *   - paths relative to a scanned root; never absolute paths
+ * Free-form values are never emitted: no env values (outside a known-safe
+ * allowlist of non-sensitive Claude Code variables), no hook or status-line
+ * command text, no MCP URLs, no permission rule arguments.
+ *
+ * Descriptions ARE emitted. They are authored prose whose whole purpose is to be
+ * read by a model for routing, and hiding them would defeat the tool. This is a
+ * deliberate, documented exception — not an oversight.
+ *
+ * Zero dependencies. Read-only, except for the opt-in --probe-hooks mode, which
+ * executes the user's own PreToolUse hooks against synthetic input in order to
+ * verify (rather than assume) that a guard actually blocks.
  *
  * Usage:
- *   node scan-harness.mjs [--pretty] [--include-values]
- *                         [--root <dir>] [--project <dir>]
+ *   node scan-harness.mjs [--pretty] [--root <dir>] [--project <dir>]
+ *                         [--include-values] [--probe-hooks]
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, basename, dirname, extname, relative, sep } from 'node:path';
+import { readFileSync, readdirSync, existsSync, lstatSync, statSync, realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { homedir, tmpdir } from 'node:os';
+import { join, basename, dirname, extname, relative, sep, isAbsolute } from 'node:path';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const HOME = homedir();
+
+// Resource budgets. Without these a 500MB claude.json blocks the host process.
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_DIR_ENTRIES = 2000;
+const MAX_WALK_DEPTH = 3;
+const PROBE_TIMEOUT_MS = 2000;
 
 // ---------------------------------------------------------------------------
 // args
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const opts = { pretty: false, includeValues: false, root: null, project: null };
+  const opts = { pretty: false, includeValues: false, probeHooks: false, root: null, project: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--pretty') opts.pretty = true;
     else if (a === '--include-values') opts.includeValues = true;
-    else if (a === '--json') opts.pretty = false; // accepted, default behaviour
+    else if (a === '--probe-hooks') opts.probeHooks = true;
+    else if (a === '--json') opts.pretty = false;
     else if (a === '--root') opts.root = argv[++i];
     else if (a === '--project') opts.project = argv[++i];
     else if (a === '--help' || a === '-h') opts.help = true;
@@ -48,82 +71,194 @@ function parseArgs(argv) {
 const HELP = `scan-harness — emit a JSON map of a Claude Code harness config
 
   --pretty           indent the JSON output
-  --include-values   do not redact paths/secrets (output is unsafe to share)
   --root <dir>       config root to scan (default: ~/.claude)
-  --project <dir>    additional project dir containing .claude/ and CLAUDE.md
+  --project <dir>    project dir containing .claude/, CLAUDE.md and .mcp.json
+  --probe-hooks      EXECUTE this machine's PreToolUse hooks against synthetic
+                     input to verify a guard actually blocks. Runs the user's own
+                     shell commands: off by default, opt in deliberately.
+  --include-values   emit raw values (UNSAFE TO SHARE)
   --help             show this message
 `;
 
+let REDACT = true;
+const HIDDEN = '<hidden>';
+
 // ---------------------------------------------------------------------------
-// safe fs helpers — every one returns a fallback instead of throwing
+// safe fs helpers — bounded, symlink-aware, never throw
 // ---------------------------------------------------------------------------
 
-const readText = (p) => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
-const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
+function readTextBounded(p) {
+  try {
+    const st = lstatSync(p);
+    if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
+    return readFileSync(p, 'utf8');
+  } catch { return null; }
+}
+const readJson = (p) => { try { return JSON.parse(readTextBounded(p) ?? ''); } catch { return null; } };
 const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
-const listDir = (p) => { try { return readdirSync(p); } catch { return []; } };
+const listDir = (p) => { try { return readdirSync(p).slice(0, MAX_DIR_ENTRIES); } catch { return []; } };
 
-/** Recursively collect files matching an extension, depth-limited. */
-function walk(dir, ext, maxDepth = 3, depth = 0, out = []) {
-  if (depth > maxDepth || !isDir(dir)) return out;
+/**
+ * Recursively collect files with an extension. Skips symlinked directories and
+ * tracks visited inodes, so a symlink loop or a fan-out farm cannot spin here.
+ */
+function walk(dir, ext, maxDepth = MAX_WALK_DEPTH, depth = 0, out = [], seen = new Set()) {
+  if (depth > maxDepth || out.length > MAX_DIR_ENTRIES) return out;
+  let key;
+  try {
+    const st = lstatSync(dir);
+    if (!st.isDirectory()) return out;
+    key = `${st.dev}:${st.ino}`;
+    if (seen.has(key)) return out;
+    seen.add(key);
+  } catch { return out; }
+
   for (const entry of listDir(dir)) {
     if (entry.startsWith('.') || entry === 'node_modules') continue;
     const full = join(dir, entry);
-    if (isDir(full)) walk(full, ext, maxDepth, depth + 1, out);
-    else if (extname(entry) === ext) out.push(full);
+    let st;
+    try { st = lstatSync(full); } catch { continue; }
+    if (st.isSymbolicLink()) continue; // never follow links out of the config tree
+    if (st.isDirectory()) walk(full, ext, maxDepth, depth + 1, out, seen);
+    else if (st.isFile() && extname(entry) === ext) out.push(full);
   }
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// redaction
-// ---------------------------------------------------------------------------
-
-const SECRET_KEY_RE = /(?:api[_-]?key|secret|token|password|passwd|bearer|credential|auth)/i;
-const SECRET_VALUE_RE = /\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g;
-
-let REDACT = true;
-
-/** Collapse the real home directory to `~` and strip obvious secret literals. */
-function scrub(str) {
-  if (typeof str !== 'string') return str;
-  if (!REDACT) return str;
-  let s = str.split(HOME).join('~');
-  s = s.replace(SECRET_VALUE_RE, '<redacted>');
-  return s;
-}
-
-/** Redact a value whose *key* suggests it is sensitive. */
-function scrubPair(key, value) {
-  if (!REDACT) return value;
-  if (SECRET_KEY_RE.test(key)) return '<redacted>';
-  return typeof value === 'string' ? scrub(value) : value;
-}
-
-/** Shorten a shell command to a summary: leading words + referenced script. */
-function summarizeCommand(cmd, limit = 80) {
-  if (typeof cmd !== 'string') return null;
-  const cleaned = scrub(cmd).replace(/\s+/g, ' ').trim();
-  const scriptMatch = cleaned.match(/[\w.-]+\.(mjs|js|sh|py|ts)\b/);
-  const out = { preview: cleaned.length > limit ? cleaned.slice(0, limit) + '…' : cleaned };
-  if (scriptMatch) out.script = scriptMatch[0];
-  return out;
+/** True when `p` resolves to a location inside `root` (symlink escapes rejected). */
+function containedIn(p, root) {
+  try {
+    const rp = realpathSync(p);
+    const rr = realpathSync(root);
+    return rp === rr || rp.startsWith(rr + sep);
+  } catch { return false; }
 }
 
 // ---------------------------------------------------------------------------
-// frontmatter (a deliberately small YAML subset: top-level scalars only)
+// emission policy (the allowlist)
 // ---------------------------------------------------------------------------
 
+let ROOTS = [];
+
+/**
+ * Paths are emitted relative to the scanned root, scope-prefixed. Absolute paths
+ * are never emitted: an earlier build leaked `/Volumes/Clients/Acme-Secret/...`
+ * because it only knew how to collapse the current user's home directory.
+ */
+function pathOf(abs) {
+  if (!REDACT) return abs;
+  if (typeof abs !== 'string') return null;
+  for (const { label, dir } of ROOTS) {
+    if (abs === dir) return `${label}:.`;
+    if (abs.startsWith(dir + sep)) return `${label}:${relative(dir, abs)}`;
+  }
+  const parent = dirname(abs);
+  for (const { label, dir } of ROOTS) {
+    if (parent === dirname(dir)) return `${label}:../${basename(abs)}`;
+  }
+  return '<external path>';
+}
+
+/** Identifiers are emitted, but bounded so a pathological name cannot dominate. */
+const ident = (s, n = 80) => {
+  if (s == null) return null;
+  const str = String(s);
+  return str.length > n ? str.slice(0, n) + '…' : str;
+};
+
+const truncate = (s, n) =>
+  typeof s === 'string' && s.length > n ? s.slice(0, n).trimEnd() + '…' : s;
+
+/**
+ * Environment values are hidden by default. Only variables on this list have
+ * their value emitted, because the map needs them and they are non-sensitive by
+ * construction (numeric or boolean Claude Code settings).
+ */
+const SAFE_ENV_VALUES = new Set([
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'DISABLE_AUTO_COMPACT',
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+  'BASH_DEFAULT_TIMEOUT_MS',
+  'BASH_MAX_TIMEOUT_MS',
+  'MAX_THINKING_TOKENS',
+  'DISABLE_TELEMETRY',
+  'DISABLE_COST_WARNINGS',
+]);
+function envValue(key, value) {
+  if (!REDACT) return String(value);
+  if (!SAFE_ENV_VALUES.has(key)) return HIDDEN;
+  const v = String(value);
+  // Even allowlisted keys only pass through if the value is a simple scalar.
+  return /^[\w.-]{1,32}$/.test(v) ? v : HIDDEN;
+}
+
+/**
+ * Commands are described, never quoted. Truncating a command does not redact it:
+ * `client --session <uuid>` leaked a live token through an 80-character preview.
+ * Only the executable and any referenced in-tree script are emitted.
+ */
+function describeCommand(cmd) {
+  if (typeof cmd !== 'string' || !cmd.trim()) return null;
+  if (!REDACT) return { raw: cmd };
+  const firstWord = cmd.trim().split(/\s+/)[0] ?? '';
+  const exe = basename(firstWord.replace(/[;&|(){}'"]/g, '')) || null;
+  const scriptAbs = cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/)?.[0] ?? null;
+  return {
+    exe: ident(exe, 40),
+    script: scriptAbs ? basename(scriptAbs) : null,
+    length: cmd.length,
+  };
+}
+
+/** URLs collapse to scheme + host. Userinfo, path, query and fragment are dropped. */
+function describeUrl(u) {
+  if (!u) return null;
+  if (!REDACT) return String(u);
+  try {
+    const parsed = new URL(String(u));
+    return `${parsed.protocol}//${parsed.hostname}`;
+  } catch { return '<url>'; }
+}
+
+/**
+ * Permission rules reduce to a tool name only when the string matches a strict
+ * tool grammar. Anything else becomes `(unrecognized)` — the previous
+ * `split('(')[0]` emitted the entire rule whenever it contained no parenthesis,
+ * exposing e.g. `Bash cat ~/.ssh/id_rsa` as a "tool name".
+ */
+const TOOL_NAME_RE = /^([A-Za-z][A-Za-z0-9_]*)(\(|$)/;
+function permissionTool(rule) {
+  const m = String(rule).match(TOOL_NAME_RE);
+  if (!m) return '(unrecognized)';
+  const name = m[1];
+  return name.length <= 64 ? name : '(unrecognized)';
+}
+
+// ---------------------------------------------------------------------------
+// frontmatter — strict subset; refuses to guess
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a small, well-defined subset of YAML and REFUSES anything outside it,
+ * recording a warning instead of approximating. A wrong value is worse than a
+ * missing one here, because the audit makes assertions from these fields.
+ *
+ * Supported: plain scalars, single-quoted, double-quoted without escapes, block
+ * scalars `>`/`|` with optional `-`/`+` chomping, and empty values (-> null).
+ * Refused: indentation indicators (`>2`), double-quoted strings containing
+ * backslash escapes, duplicate keys, anchors/aliases/tags.
+ */
 function parseFrontmatter(text) {
   if (typeof text !== 'string') return null;
-  // Tolerate a leading BOM / blank lines before the opening fence.
   const m = text.match(/^﻿?\s*---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!m) return null;
+
   const fm = {};
+  const warnings = [];
   const lines = m[1].split(/\r?\n/);
+
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
-    // Skip list items, nested keys, comments and blanks — we only want scalars.
     if (!rawLine.trim() || rawLine.trimStart().startsWith('#')) continue;
     if (/^\s/.test(rawLine) || rawLine.trimStart().startsWith('-')) continue;
     const kv = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
@@ -131,33 +266,59 @@ function parseFrontmatter(text) {
     const key = kv[1];
     let value = kv[2].trim();
 
-    // Block scalars: `key: >`, `>-`, `|`, `|-` … the real value is the indented
-    // block that follows. Without this, the value reads as a single ">" and any
-    // length-based check on it is nonsense.
-    const block = value.match(/^([>|])([-+]?)$/);
+    if (Object.prototype.hasOwnProperty.call(fm, key)) {
+      warnings.push(`duplicate key '${key}'`);
+      continue;
+    }
+
+    if (value === '') {
+      // Could be YAML null or the start of a nested block; either way there is
+      // no scalar here. Record null rather than an empty string.
+      const next = lines[i + 1];
+      if (next && /^\s+\S/.test(next)) { fm[key] = null; continue; }
+      fm[key] = null;
+      continue;
+    }
+    if (value.startsWith('&') || value.startsWith('*') || value.startsWith('!')) {
+      warnings.push(`unsupported anchor/alias/tag for '${key}'`);
+      continue;
+    }
+
+    const block = value.match(/^([>|])([0-9]*)([-+]?)$/);
     if (block) {
+      if (block[2]) { warnings.push(`indentation indicator unsupported for '${key}'`); continue; }
       const body = [];
       while (i + 1 < lines.length) {
         const next = lines[i + 1];
-        if (next.trim() && !/^\s/.test(next)) break; // dedented: block is over
-        body.push(next.trim());
+        if (next.trim() && !/^\s/.test(next)) break;
+        body.push(next.replace(/^\s{0,8}/, ''));
         i++;
       }
-      while (body.length && !body[body.length - 1]) body.pop();
-      value = block[1] === '>' ? body.join(' ').replace(/\s+/g, ' ').trim() : body.join('\n');
-    } else if (
-      (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
-      (value.startsWith("'") && value.endsWith("'") && value.length > 1)
-    ) {
+      while (body.length && !body[body.length - 1].trim()) body.pop();
+      if (block[1] === '>') {
+        // Folded: blank lines are paragraph breaks and must survive folding.
+        const paras = body.join('\n').split(/\n\s*\n/).map((p) => p.replace(/\s+/g, ' ').trim());
+        value = paras.filter(Boolean).join('\n\n');
+      } else {
+        value = body.join('\n');
+      }
+      if (block[3] === '-') value = value.replace(/\n+$/, '');
+      fm[key] = value;
+      continue;
+    }
+
+    if (value.startsWith('"') && value.endsWith('"') && value.length > 1) {
+      if (value.includes('\\')) { warnings.push(`escape sequences unsupported for '${key}'`); continue; }
       value = value.slice(1, -1);
+    } else if (value.startsWith("'") && value.endsWith("'") && value.length > 1) {
+      value = value.slice(1, -1).replace(/''/g, "'");
     }
     fm[key] = value;
   }
+
+  Object.defineProperty(fm, '__warnings', { value: warnings, enumerable: false });
   return fm;
 }
-
-const truncate = (s, n) =>
-  typeof s === 'string' && s.length > n ? s.slice(0, n).trimEnd() + '…' : s;
 
 // ---------------------------------------------------------------------------
 // layer helpers
@@ -166,18 +327,10 @@ const truncate = (s, n) =>
 const ok = (items, extra = {}) => ({ status: 'ok', count: items.length, items, ...extra });
 const unconfigured = (reason, extra = {}) => ({ status: 'unconfigured', count: 0, items: [], reason, ...extra });
 
-/** Run a layer builder, converting any unexpected throw into status:"error". */
 function layer(fn, label) {
-  try {
-    return fn();
-  } catch (err) {
-    return { status: 'error', count: 0, items: [], reason: `failed to scan ${label}: ${err.message}` };
-  }
+  try { return fn(); }
+  catch (err) { return { status: 'error', count: 0, items: [], reason: `failed to scan ${label}: ${err.message}` }; }
 }
-
-// ---------------------------------------------------------------------------
-// settings (merged across user + local + project, precedence recorded)
-// ---------------------------------------------------------------------------
 
 function collectSettings(roots) {
   const files = [];
@@ -185,7 +338,9 @@ function collectSettings(roots) {
     for (const name of ['settings.json', 'settings.local.json']) {
       const p = join(dir, name);
       const data = readJson(p);
-      if (data) files.push({ scope: label, file: scrub(p), data });
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        files.push({ scope: label, file: pathOf(p), data });
+      }
     }
   }
   return files;
@@ -197,37 +352,34 @@ function collectSettings(roots) {
 
 function scanAgents(roots) {
   const items = [];
+  const parseWarnings = [];
   for (const { label, dir } of roots) {
     const agentsDir = join(dir, 'agents');
     if (!isDir(agentsDir)) continue;
     for (const file of walk(agentsDir, '.md', 2)) {
-      const fm = parseFrontmatter(readText(file));
+      const fm = parseFrontmatter(readTextBounded(file));
       if (!fm) continue;
+      if (fm.__warnings?.length) parseWarnings.push({ file: pathOf(file), warnings: fm.__warnings });
       items.push({
-        name: fm.name || basename(file, '.md'),
-        model: fm.model || null,
-        modelExplicit: Boolean(fm.model) && fm.model !== 'inherit',
-        description: truncate(scrub(fm.description || ''), 160) || null,
-        tools: fm.tools ? truncate(fm.tools, 80) : null,
+        name: ident(fm.name || basename(file, '.md')),
+        model: fm.model ? ident(fm.model, 40) : null,
+        description: truncate(fm.description ?? '', 200) || null,
+        descriptionLength: (fm.description ?? '').length,
+        tools: fm.tools ? truncate(fm.tools, 60) : null,
         scope: label,
-        file: scrub(file),
+        file: pathOf(file),
       });
     }
   }
   if (!items.length) return unconfigured('no agents/*.md with frontmatter found');
 
-  // Tier summary: how many agents sit on each model binding.
   const byModel = {};
-  for (const a of items) {
-    const key = a.model || '(unset)';
-    byModel[key] = (byModel[key] || 0) + 1;
-  }
-  const bareInherit = items.filter((a) => a.model === 'inherit').map((a) => a.name);
-  const unpinned = items.filter((a) => !a.model).map((a) => a.name);
+  for (const a of items) byModel[a.model || '(unset)'] = (byModel[a.model || '(unset)'] || 0) + 1;
   return ok(items.sort((a, b) => a.name.localeCompare(b.name)), {
     byModel,
-    bareInherit,
-    unpinned,
+    bareInherit: items.filter((a) => a.model === 'inherit').map((a) => a.name),
+    unpinned: items.filter((a) => !a.model).map((a) => a.name),
+    parseWarnings,
   });
 }
 
@@ -235,18 +387,17 @@ function scanHooks(settingsFiles) {
   const items = [];
   for (const { scope, file, data } of settingsFiles) {
     const hooks = data?.hooks;
-    if (!hooks || typeof hooks !== 'object') continue;
+    if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) continue;
     for (const [event, entries] of Object.entries(hooks)) {
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
-        const defs = Array.isArray(entry?.hooks) ? entry.hooks : [];
-        for (const def of defs) {
+        for (const def of Array.isArray(entry?.hooks) ? entry.hooks : []) {
           items.push({
-            event,
-            matcher: entry?.matcher === '' ? '(all)' : entry?.matcher ?? '(all)',
-            type: def?.type ?? null,
-            timeout: def?.timeout ?? null,
-            command: summarizeCommand(def?.command),
+            event: ident(event, 40),
+            matcher: entry?.matcher === '' || entry?.matcher == null ? '(all)' : ident(entry.matcher, 60),
+            type: ident(def?.type, 20),
+            timeout: typeof def?.timeout === 'number' ? def.timeout : null,
+            command: describeCommand(def?.command),
             scope,
             source: file,
           });
@@ -259,48 +410,86 @@ function scanHooks(settingsFiles) {
   const byEvent = {};
   for (const h of items) byEvent[h.event] = (byEvent[h.event] || 0) + 1;
 
-  // Audit facts computed from the FULL command text, which never leaves this
-  // function — only the resulting booleans and path-existence flags are emitted,
-  // so redaction is preserved.
-  const allCommands = [];
+  // Referenced scripts: only existence and in-tree name are emitted.
+  const scriptRefs = [];
+  const seenPath = new Set();
   for (const { data } of settingsFiles) {
     for (const entries of Object.values(data?.hooks ?? {})) {
       if (!Array.isArray(entries)) continue;
-      for (const e of entries) for (const h of e?.hooks ?? []) if (h?.command) allCommands.push(String(h.command));
-    }
-  }
-  const preToolText = (() => {
-    const out = [];
-    for (const { data } of settingsFiles) {
-      for (const e of data?.hooks?.PreToolUse ?? []) for (const h of e?.hooks ?? []) if (h?.command) out.push(String(h.command));
-    }
-    return out.join('\n').toLowerCase();
-  })();
-
-  const guards = {};
-  for (const [key, re] of Object.entries({
-    'rm -rf': /rm\s+-rf|rm\s+-fr/,
-    'drop table': /drop\s+table/,
-    'drop database': /drop\s+database/,
-    truncate: /truncate/,
-    'reset --hard': /reset\s+--hard/,
-    'force push': /push\s+(?:--force|-f)\b|--force-with-lease|force[\s-]?push/,
-    'secret files': /\.env|credential|secret|\.pem|\.key/,
-  })) guards[key] = re.test(preToolText);
-
-  // Absolute script paths referenced by any hook — a dangling one is a silent no-op.
-  const scriptRefs = [];
-  const seenPath = new Set();
-  for (const cmd of allCommands) {
-    for (const m of cmd.match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
-      if (seenPath.has(m)) continue;
-      seenPath.add(m);
-      scriptRefs.push({ path: scrub(m), exists: existsSync(m) });
+      for (const e of entries) for (const h of e?.hooks ?? []) {
+        for (const p of String(h?.command ?? '').match(/\/[\w.\-/]+\.(?:mjs|js|sh|py|ts)\b/g) ?? []) {
+          if (seenPath.has(p)) continue;
+          seenPath.add(p);
+          scriptRefs.push({ path: pathOf(p), name: basename(p), exists: existsSync(p) });
+        }
+      }
     }
   }
 
-  const missingTimeout = items.filter((h) => h.timeout == null).length;
-  return ok(items, { byEvent, events: Object.keys(byEvent).sort(), guards, scriptRefs, missingTimeout });
+  return ok(items, {
+    byEvent,
+    events: Object.keys(byEvent).sort(),
+    scriptRefs,
+    missingTimeout: items.filter((h) => h.timeout == null).length,
+  });
+}
+
+/**
+ * Execute this machine's PreToolUse hooks against synthetic tool input to learn
+ * whether a guard actually blocks. Opt-in only.
+ *
+ * Pattern-matching a hook's command text cannot establish this: a hook reading
+ * `echo 'rm -rf, drop table' >/dev/null; exit 0` matches every guard pattern and
+ * blocks nothing. Only running it and observing the exit status is proof.
+ *
+ * Rails: 2s timeout, throwaway cwd, minimal environment, no stdio inheritance,
+ * and HARNESS_MAP_PROBE=1 so a hook can detect a probe and no-op.
+ */
+const PROBE_COMMANDS = {
+  'rm -rf': 'rm -rf /tmp/harness-map-probe-target',
+  'drop table': 'psql -c "drop table users"',
+  'drop database': 'psql -c "drop database production"',
+  'reset --hard': 'git reset --hard HEAD~5',
+  'force push': 'git push --force origin main',
+};
+
+function probeHooks(settingsFiles) {
+  const results = {};
+  const cwd = tmpdir();
+  const commands = [];
+  for (const { data } of settingsFiles) {
+    for (const e of data?.hooks?.PreToolUse ?? []) {
+      const matcher = e?.matcher ?? '';
+      if (matcher && !/bash/i.test(matcher)) continue; // only Bash-facing guards
+      for (const h of e?.hooks ?? []) if (h?.type === 'command' && h?.command) commands.push(String(h.command));
+    }
+  }
+
+  for (const [pattern, synthetic] of Object.entries(PROBE_COMMANDS)) {
+    const toolInput = JSON.stringify({ tool_name: 'Bash', command: synthetic });
+    let blocked = false;
+    let ran = 0;
+    for (const command of commands) {
+      try {
+        const r = spawnSync('sh', ['-c', command], {
+          cwd,
+          timeout: PROBE_TIMEOUT_MS,
+          stdio: ['ignore', 'ignore', 'ignore'],
+          env: {
+            PATH: process.env.PATH ?? '/usr/bin:/bin',
+            HOME: process.env.HOME ?? HOME,
+            TOOL_INPUT: toolInput,
+            CLAUDE_TOOL_INPUT: toolInput,
+            HARNESS_MAP_PROBE: '1',
+          },
+        });
+        ran++;
+        if (typeof r.status === 'number' && r.status !== 0) blocked = true;
+      } catch { /* a hook that cannot run is not a guard */ }
+    }
+    results[pattern] = { blocked, hooksRun: ran };
+  }
+  return { probed: true, hookCount: commands.length, results };
 }
 
 function scanCommands(roots) {
@@ -309,17 +498,15 @@ function scanCommands(roots) {
     const cmdDir = join(dir, 'commands');
     if (!isDir(cmdDir)) continue;
     for (const file of walk(cmdDir, '.md', 3)) {
-      const fm = parseFrontmatter(readText(file)) || {};
+      const fm = parseFrontmatter(readTextBounded(file)) || {};
       const rel = relative(cmdDir, file).replace(/\.md$/, '');
-      // Nested dirs namespace the command: commands/codex/review.md -> /codex:review
       const parts = rel.split(sep);
       const name = parts.length > 1 ? `${parts.slice(0, -1).join(':')}:${parts.at(-1)}` : parts[0];
       items.push({
-        name: `/${name}`,
-        description: truncate(scrub(fm.description || ''), 140) || null,
-        argumentHint: fm['argument-hint'] ? truncate(fm['argument-hint'], 80) : null,
+        name: `/${ident(name, 60)}`,
+        description: truncate(fm.description ?? '', 160) || null,
         scope: label,
-        file: scrub(file),
+        file: pathOf(file),
       });
     }
   }
@@ -328,25 +515,26 @@ function scanCommands(roots) {
 
 function scanSkills(roots) {
   const items = [];
+  const parseWarnings = [];
   for (const { label, dir } of roots) {
     const skillsDir = join(dir, 'skills');
     if (!isDir(skillsDir)) continue;
     for (const entry of listDir(skillsDir)) {
       const skillFile = join(skillsDir, entry, 'SKILL.md');
       if (!existsSync(skillFile)) continue;
-      const fm = parseFrontmatter(readText(skillFile)) || {};
+      const fm = parseFrontmatter(readTextBounded(skillFile)) || {};
+      if (fm.__warnings?.length) parseWarnings.push({ file: pathOf(skillFile), warnings: fm.__warnings });
       items.push({
-        name: fm.name || entry,
-        description: truncate(scrub(fm.description || ''), 160) || null,
-        // Full length matters for routing: a short description is a weak trigger
-        // surface, and the truncated field above cannot show that.
-        descriptionLength: (fm.description || '').length,
-        userInvocable: fm.user_invocable === 'true' || fm.user_invocable === true || null,
+        name: ident(fm.name || entry),
+        description: truncate(fm.description ?? '', 200) || null,
+        descriptionLength: (fm.description ?? '').length,
         scope: label,
       });
     }
   }
-  return items.length ? ok(items.sort((a, b) => a.name.localeCompare(b.name))) : unconfigured('no skills/*/SKILL.md found');
+  return items.length
+    ? ok(items.sort((a, b) => a.name.localeCompare(b.name)), { parseWarnings })
+    : unconfigured('no skills/*/SKILL.md found');
 }
 
 function scanPlugins(userDir, settingsFiles) {
@@ -354,8 +542,6 @@ function scanPlugins(userDir, settingsFiles) {
   const known = readJson(join(userDir, 'plugins', 'known_marketplaces.json'));
   const items = [];
 
-  // enabledPlugins maps "name@marketplace" -> boolean. A plugin can be installed
-  // but switched off, in which case its commands/skills/MCP servers are inert.
   const enabledMap = {};
   for (const { data } of settingsFiles) {
     const ep = data?.enabledPlugins;
@@ -365,13 +551,13 @@ function scanPlugins(userDir, settingsFiles) {
   const plugins = installed?.plugins;
   if (plugins && typeof plugins === 'object') {
     for (const [key, entries] of Object.entries(plugins)) {
-      const [name, marketplace] = key.split('@');
+      const [name, marketplace] = String(key).split('@');
       const first = Array.isArray(entries) ? entries[0] : entries;
       items.push({
-        name,
-        marketplace: marketplace ?? null,
-        scope: first?.scope ?? null,
-        version: first?.version ?? null,
+        name: ident(name),
+        marketplace: ident(marketplace, 60) ?? null,
+        scope: ident(first?.scope, 20) ?? null,
+        version: ident(first?.version, 40) ?? null,
         enabled: key in enabledMap ? Boolean(enabledMap[key]) : null,
       });
     }
@@ -382,81 +568,76 @@ function scanPlugins(userDir, settingsFiles) {
     for (const [name, meta] of Object.entries(known)) {
       const src = meta?.source ?? {};
       marketplaces.push({
-        name,
-        type: src.source ?? null,
-        repo: src.repo ?? (src.path ? scrub(src.path) : null),
+        name: ident(name),
+        type: ident(src.source, 20) ?? null,
+        // A marketplace repo slug is a public identifier; a local path is not.
+        repo: src.repo ? ident(src.repo, 80) : src.path ? pathOf(src.path) : null,
       });
     }
   }
 
   if (!items.length && !marketplaces.length) return unconfigured('no installed plugins or marketplaces found');
-  const disabled = items.filter((p) => p.enabled === false).map((p) => p.name);
-  return ok(items.sort((a, b) => a.name.localeCompare(b.name)), { marketplaces, disabled });
+  return ok(items.sort((a, b) => a.name.localeCompare(b.name)), {
+    marketplaces,
+    disabled: items.filter((p) => p.enabled === false).map((p) => p.name),
+  });
 }
 
 /**
- * MCP servers are declared in four different places. Reading only settings.json
- * (the obvious one) undercounts badly — most servers live in ~/.claude.json or
- * are bundled with a plugin.
- *
- *   1. settings.json / settings.local.json  -> mcpServers
- *   2. ~/.claude.json                       -> mcpServers          (global)
- *   3. ~/.claude.json                       -> projects[path].mcpServers
- *   4. a plugin's own .mcp.json             (inert if plugin disabled)
- *   5. <root>/.mcp.json, <project>/.mcp.json
- *
- * Account-level connectors (Gmail, Drive, Figma, …) are provisioned server-side
- * and are NOT discoverable from disk; they are reported as a caveat, not a count.
+ * MCP servers, resolved in Claude Code's documented precedence order:
+ *   local (project entry in claude.json) > project (.mcp.json) > user > plugin
+ * Only the ACTIVE project's local entry participates; other projects are counted
+ * but their paths are never emitted (they name client work and private repos).
  */
 function scanMcp(settingsFiles, roots, userDir, projectPath) {
-  const items = [];
-  const push = (name, cfg, origin, source, extra = {}) => {
-    items.push({
-      name,
-      transport: cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null),
-      command: cfg?.command ? scrub(String(cfg.command)) : null,
-      // Args and env routinely carry tokens — never emit them raw when redacting.
-      argsCount: Array.isArray(cfg?.args) ? cfg.args.length : 0,
-      envKeys: cfg?.env && typeof cfg.env === 'object'
-        ? Object.keys(cfg.env).map((k) => (REDACT ? k : `${k}=${cfg.env[k]}`))
-        : [],
-      url: cfg?.url ? (REDACT ? scrub(String(cfg.url)).replace(/\?.*$/, '?<redacted>') : String(cfg.url)) : null,
-      origin,
-      source,
-      ...extra,
-    });
-  };
+  const layers = { local: [], project: [], user: [], plugin: [] };
+  const mk = (name, cfg, origin, extra = {}) => ({
+    name: ident(name),
+    origin,
+    transport: cfg?.type ?? (cfg?.url ? 'http' : cfg?.command ? 'stdio' : null),
+    command: cfg?.command ? ident(basename(String(cfg.command)), 40) : null,
+    argsCount: Array.isArray(cfg?.args) ? cfg.args.length : 0,
+    envKeys: cfg?.env && typeof cfg.env === 'object' ? Object.keys(cfg.env).map((k) => ident(k, 40)) : [],
+    url: describeUrl(cfg?.url),
+    ...extra,
+  });
+  const each = (obj, fn) => { if (obj && typeof obj === 'object' && !Array.isArray(obj)) for (const [n, c] of Object.entries(obj)) fn(n, c); };
 
-  const eachServer = (obj, fn) => {
-    if (obj && typeof obj === 'object') for (const [n, c] of Object.entries(obj)) fn(n, c);
-  };
-
-  // (1) settings files
-  for (const { scope, file, data } of settingsFiles) {
-    eachServer(data?.mcpServers, (n, c) => push(n, c, `settings (${scope})`, file));
-  }
-
-  // (2)+(3) claude.json — global and per-project.
-  // It sits beside the config dir (~/.claude.json next to ~/.claude/), so derive
-  // it from the root's parent. That keeps --root scans hermetic for fixtures.
   const claudeJsonPath = join(dirname(userDir), '.claude.json');
   const claudeJson = readJson(claudeJsonPath);
+  const activeProject = projectPath ? realpathOr(projectPath) : null;
+  let otherProjectServers = 0;
+  let otherProjects = 0;
+
   if (claudeJson) {
-    eachServer(claudeJson.mcpServers, (n, c) => push(n, c, 'global', scrub(claudeJsonPath)));
+    each(claudeJson.mcpServers, (n, c) => layers.user.push(mk(n, c, 'user')));
     const projects = claudeJson.projects;
     if (projects && typeof projects === 'object') {
-      const active = projectPath || process.cwd();
       for (const [path, cfg] of Object.entries(projects)) {
-        eachServer(cfg?.mcpServers, (n, c) =>
-          push(n, c, 'project', scrub(claudeJsonPath), {
-            projectPath: scrub(path),
-            active: path === active,
-          }));
+        const servers = cfg?.mcpServers;
+        if (!servers || typeof servers !== 'object') continue;
+        if (activeProject && realpathOr(path) === activeProject) {
+          each(servers, (n, c) => layers.local.push(mk(n, c, 'local')));
+        } else {
+          otherProjects++;
+          otherProjectServers += Object.keys(servers).length;
+        }
       }
     }
   }
 
-  // (4) plugin-bundled servers — only meaningful when the plugin is enabled
+  for (const { scope, data } of settingsFiles) {
+    each(data?.mcpServers, (n, c) => layers[scope === 'project' ? 'project' : 'user'].push(mk(n, c, `settings (${scope})`)));
+  }
+
+  // Project-scope file lives at <project>/.mcp.json — NOT <project>/.claude/.mcp.json.
+  if (projectPath) {
+    each(readJson(join(projectPath, '.mcp.json'))?.mcpServers, (n, c) => layers.project.push(mk(n, c, 'project')));
+  }
+  for (const { dir } of roots) {
+    each(readJson(join(dir, '.mcp.json'))?.mcpServers, (n, c) => layers.user.push(mk(n, c, 'user')));
+  }
+
   const enabledMap = {};
   for (const { data } of settingsFiles) {
     const ep = data?.enabledPlugins;
@@ -469,158 +650,144 @@ function scanMcp(settingsFiles, roots, userDir, projectPath) {
   for (const base of ['marketplaces', 'cache']) {
     const dir = join(userDir, 'plugins', base);
     for (const entry of listDir(dir)) {
-      for (const candidate of [join(dir, entry, '.mcp.json'), ...listDir(join(dir, entry)).map((sub) => join(dir, entry, sub, '.mcp.json'))]) {
+      const candidates = [join(dir, entry, '.mcp.json'), ...listDir(join(dir, entry)).map((s) => join(dir, entry, s, '.mcp.json'))];
+      for (const candidate of candidates) {
         const data = readJson(candidate);
         if (!data) continue;
-        const owner = basename(candidate.replace(/\/.mcp\.json$/, ''));
+        const owner = basename(dirname(candidate));
         const enabled = pluginEnabled(owner);
-        eachServer(data.mcpServers, (n, c) =>
-          push(n, c, 'plugin', scrub(candidate), { plugin: owner, enabled }));
+        each(data.mcpServers, (n, c) => layers.plugin.push(mk(n, c, 'plugin', { plugin: ident(owner), enabled })));
       }
     }
   }
 
-  // (5) explicit .mcp.json next to a config root
-  for (const { label, dir } of roots) {
-    const mcpFile = join(dir, '.mcp.json');
-    const data = readJson(mcpFile);
-    eachServer(data?.mcpServers, (n, c) => push(n, c, `file (${label})`, scrub(mcpFile)));
+  // Precedence: first definition wins, walking highest-priority scope first.
+  const resolved = new Map();
+  for (const scope of ['local', 'project', 'user', 'plugin']) {
+    for (const s of layers[scope]) {
+      const prev = resolved.get(s.name);
+      if (!prev) resolved.set(s.name, { ...s, active: s.enabled !== false });
+      else (prev.shadowed ||= []).push(s.origin);
+    }
   }
-
-  // Same server can be declared in more than one place; keep the first, note the rest.
-  const seen = new Map();
-  for (const it of items) {
-    const prev = seen.get(it.name);
-    if (!prev) seen.set(it.name, it);
-    else (prev.alsoDeclaredIn ||= []).push(it.origin);
-  }
-  const unique = [...seen.values()];
+  const items = [...resolved.values()];
 
   const caveat = 'Account-level connectors (for example Gmail, Drive, Figma, Slack) are provisioned server-side and cannot be detected from configuration files.';
-  if (!unique.length) return unconfigured('no MCP servers found in settings, ~/.claude.json, or plugins', { caveat });
-
+  if (!items.length) {
+    return unconfigured('no MCP servers found in settings, claude.json, or plugins', { caveat, otherProjects, otherProjectServers });
+  }
   const byOrigin = {};
-  for (const m of unique) byOrigin[m.origin] = (byOrigin[m.origin] || 0) + 1;
-  const inactive = unique.filter((m) => m.enabled === false || (m.origin === 'project' && m.active === false)).length;
-  return ok(unique, { byOrigin, inactive, caveat });
+  for (const m of items) byOrigin[m.origin] = (byOrigin[m.origin] || 0) + 1;
+  return ok(items, {
+    byOrigin,
+    caveat,
+    otherProjects,
+    otherProjectServers,
+    inactive: items.filter((m) => !m.active).length,
+  });
 }
+
+const realpathOr = (p) => { try { return realpathSync(p); } catch { return p; } };
 
 function scanEnvironment(settingsFiles) {
   const env = {};
-  const permissions = { allow: 0, deny: 0, ask: 0, defaultMode: null, toolBreakdown: {} };
+  const permissions = { allow: 0, deny: 0, ask: 0, defaultMode: null, toolBreakdown: {}, unrecognized: 0 };
   let model = null;
   let statusLine = null;
 
   for (const { data } of settingsFiles) {
     if (!data) continue;
-    if (data.model) model = data.model;
-    if (data.statusLine) {
+    if (typeof data.model === 'string') model = ident(data.model, 60);
+    if (data.statusLine && typeof data.statusLine === 'object') {
       const raw = String(data.statusLine.command ?? '');
       const ref = raw.match(/\/[\w.\-/]+\.(?:sh|mjs|js|py|ts)\b/)?.[0] ?? null;
       statusLine = {
-        type: data.statusLine.type ?? null,
-        command: summarizeCommand(data.statusLine.command),
-        script: ref ? { path: scrub(ref), exists: existsSync(ref) } : null,
+        type: ident(data.statusLine.type, 20),
+        command: describeCommand(data.statusLine.command),
+        script: ref ? { name: basename(ref), exists: existsSync(ref) } : null,
       };
     }
-    if (data.env && typeof data.env === 'object') {
-      for (const [k, v] of Object.entries(data.env)) env[k] = scrubPair(k, String(v));
+    if (data.env && typeof data.env === 'object' && !Array.isArray(data.env)) {
+      for (const [k, v] of Object.entries(data.env)) env[ident(k, 60)] = envValue(k, v);
     }
     const p = data.permissions;
-    if (p && typeof p === 'object') {
-      if (p.defaultMode) permissions.defaultMode = p.defaultMode;
+    if (p && typeof p === 'object' && !Array.isArray(p)) {
+      if (typeof p.defaultMode === 'string') permissions.defaultMode = ident(p.defaultMode, 30);
       for (const bucket of ['allow', 'deny', 'ask']) {
         const list = p[bucket];
         if (!Array.isArray(list)) continue;
         permissions[bucket] += list.length;
         if (bucket !== 'allow') continue;
-        // Coarse breakdown only: the tool name, never the full rule argument.
         for (const rule of list) {
-          const tool = String(rule).split('(')[0].trim() || '(unknown)';
-          permissions.toolBreakdown[tool] = (permissions.toolBreakdown[tool] || 0) + 1;
+          const tool = permissionTool(rule);
+          if (tool === '(unrecognized)') permissions.unrecognized++;
+          else permissions.toolBreakdown[tool] = (permissions.toolBreakdown[tool] || 0) + 1;
         }
       }
     }
   }
 
-  const hasAny = model || statusLine || Object.keys(env).length || permissions.allow;
-  if (!hasAny) return { status: 'unconfigured', reason: 'no model/env/permissions/statusLine in settings' };
+  if (!(model || statusLine || Object.keys(env).length || permissions.allow)) {
+    return { status: 'unconfigured', reason: 'no model/env/permissions/statusLine in settings' };
+  }
   return { status: 'ok', model, statusLine, env, permissions };
 }
 
+/** Rule files are read for headings only, and never through a symlink. */
 function scanRules(roots) {
   const items = [];
+  const headingsOf = (text, n) => text.split(/\r?\n/)
+    .filter((l) => /^#{1,3}\s/.test(l))
+    .map((l) => truncate(l.replace(/^#+\s*/, '').trim(), 90))
+    .slice(0, n);
+
   for (const { label, dir } of roots) {
     const rulesDir = join(dir, 'rules');
     if (!isDir(rulesDir)) continue;
     for (const file of walk(rulesDir, '.md', 1)) {
-      const text = readText(file) || '';
-      const headings = text
-        .split(/\r?\n/)
-        .filter((l) => /^#{1,3}\s/.test(l))
-        .map((l) => l.replace(/^#+\s*/, '').trim())
-        .slice(0, 12);
-      items.push({ name: basename(file, '.md'), file: scrub(file), headings, scope: label });
+      const text = readTextBounded(file);
+      if (text == null) continue;
+      items.push({ name: ident(basename(file, '.md')), file: pathOf(file), headings: headingsOf(text, 12), scope: label, contained: true });
     }
   }
-  // CLAUDE.md files are the other prose source.
   for (const { label, dir, claudeMd } of roots) {
     const p = claudeMd || join(dir, 'CLAUDE.md');
-    const text = readText(p);
-    if (!text) continue;
-    const headings = text
-      .split(/\r?\n/)
-      .filter((l) => /^#{1,3}\s/.test(l))
-      .map((l) => l.replace(/^#+\s*/, '').trim())
-      .slice(0, 20);
-    items.push({ name: 'CLAUDE.md', file: scrub(p), headings, scope: label });
+    let st;
+    try { st = lstatSync(p); } catch { continue; }
+    if (st.isSymbolicLink()) continue;
+    const text = readTextBounded(p);
+    if (text == null) continue;
+    items.push({ name: 'CLAUDE.md', file: pathOf(p), headings: headingsOf(text, 20), scope: label, contained: true });
   }
   return items.length ? ok(items) : unconfigured('no rules/*.md or CLAUDE.md found');
 }
 
-// --- prose-backed layers: detect deterministic signals, point at the prose ----
-
 const ORCHESTRATOR_NAMES = ['goal', 'loop', 'supergoal', 'ultrawork', 'improve', 'gsd', 'ship-issue', 'foreman'];
 const REVIEWER_HINTS = ['review', 'linus', 'codex', 'gemini', 'neo', 'verifier', 'critic', 'audit'];
-
-/**
- * Bundled skill packs (Google Workspace recipes, personas) contain names like
- * "recipe-review-overdue-tasks" that substring-match a reviewer hint without
- * being code reviewers. Exclude those namespaces from prose-layer detection.
- */
 const PACK_PREFIXES = ['recipe-', 'persona-', 'gws-'];
 const inSkillPack = (n) => PACK_PREFIXES.some((p) => String(n).toLowerCase().startsWith(p));
 
-/**
- * Prose layers cannot be parsed deterministically, but their *presence* can be
- * detected: known orchestrator skills/commands and rule files that discuss them.
- * Status "ok" here means "there is something to interpret", and proseRefs tells
- * the renderer which files to read. It never means the tree was parsed.
- */
 function scanProseLayer(kind, { skills, commands, agents, rules }) {
   const names = kind === 'orchestrators' ? ORCHESTRATOR_NAMES : REVIEWER_HINTS;
   const match = (n) => {
     if (inSkillPack(n)) return false;
     const lower = String(n).toLowerCase();
-    // Orchestrators are matched exactly (a skill IS the orchestrator); reviewer
-    // detection is looser because names vary (linus-code-review, neo-review…).
     return names.some((k) => (kind === 'orchestrators' ? lower === k : lower.includes(k)));
   };
 
   const found = [];
   for (const s of skills.items ?? []) if (match(s.name)) found.push({ kind: 'skill', name: s.name });
-  for (const c of commands.items ?? []) if (match(c.name.replace(/^\//, '').split(':').pop())) found.push({ kind: 'command', name: c.name });
-  if (kind === 'review') for (const a of agents.items ?? []) if (match(a.name)) found.push({ kind: 'agent', name: a.name });
-  if (kind === 'orchestrators') for (const a of agents.items ?? []) if (match(a.name)) found.push({ kind: 'agent', name: a.name });
+  for (const c of commands.items ?? []) if (match(String(c.name).replace(/^\//, '').split(':').pop())) found.push({ kind: 'command', name: c.name });
+  for (const a of agents.items ?? []) if (match(a.name)) found.push({ kind: 'agent', name: a.name });
 
   const wanted = kind === 'orchestrators'
     ? ['agent-routing', 'context-hygiene', 'CLAUDE.md']
     : ['verifier-protocol', 'agent-routing', 'safety', 'CLAUDE.md'];
+  // Only contained, non-symlinked files are offered for interpretation.
   const proseRefs = (rules.items ?? [])
-    .filter((r) => wanted.some((w) => r.name.includes(w)))
+    .filter((r) => r.contained && wanted.some((w) => r.name.includes(w)))
     .map((r) => ({ name: r.name, file: r.file, headings: r.headings }));
 
-  // Dedupe by kind+name — a skill and its command often share a name.
   const seen = new Set();
   const items = found.filter((f) => {
     const key = `${f.kind}:${f.name}`;
@@ -629,9 +796,6 @@ function scanProseLayer(kind, { skills, commands, agents, rules }) {
     return true;
   });
 
-  // A bare CLAUDE.md is not evidence of a configured orchestrator/review layer —
-  // nearly every project has one. Require either a detected skill/command/agent,
-  // or a *dedicated* rule file (agent-routing.md, verifier-protocol.md, …).
   const dedicatedRefs = proseRefs.filter((r) => r.name !== 'CLAUDE.md');
   if (!items.length && !dedicatedRefs.length) {
     return unconfigured(
@@ -650,10 +814,7 @@ function scanProseLayer(kind, { skills, commands, agents, rules }) {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (opts.help) {
-    process.stdout.write(HELP);
-    return 0;
-  }
+  if (opts.help) { process.stdout.write(HELP); return 0; }
   REDACT = !opts.includeValues;
 
   const userDir = opts.root ? opts.root : join(HOME, '.claude');
@@ -661,24 +822,30 @@ function main() {
   if (opts.project) {
     roots.push({ label: 'project', dir: join(opts.project, '.claude'), claudeMd: join(opts.project, 'CLAUDE.md') });
   }
+  ROOTS = roots;
 
-  const sources = roots.map((r) => ({ scope: r.label, path: scrub(r.dir), exists: isDir(r.dir) }));
   const settingsFiles = collectSettings(roots);
-
   const agents = layer(() => scanAgents(roots), 'agents');
   const commands = layer(() => scanCommands(roots), 'commands');
   const skills = layer(() => scanSkills(roots), 'skills');
   const rules = layer(() => scanRules(roots), 'rules');
+  const hooks = layer(() => scanHooks(settingsFiles), 'hooks');
+
+  if (opts.probeHooks && hooks.status === 'ok') {
+    try { hooks.probe = probeHooks(settingsFiles); }
+    catch (e) { hooks.probe = { probed: false, reason: e.message }; }
+  }
 
   const doc = {
     schemaVersion: SCHEMA_VERSION,
     tool: 'harness-map',
     redacted: REDACT,
-    sources,
+    hooksProbed: Boolean(opts.probeHooks),
+    sources: roots.map((r) => ({ scope: r.label, path: pathOf(r.dir), exists: isDir(r.dir) })),
     settingsFiles: settingsFiles.map((s) => ({ scope: s.scope, file: s.file })),
     layers: {
       agents,
-      hooks: layer(() => scanHooks(settingsFiles), 'hooks'),
+      hooks,
       environment: layer(() => scanEnvironment(settingsFiles), 'environment'),
       commands,
       skills,

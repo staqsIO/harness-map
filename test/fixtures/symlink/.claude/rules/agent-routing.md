@@ -1,0 +1,1 @@
+/Users/ericgang/harness-map/test/fixtures/symlink/secret.txt

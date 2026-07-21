@@ -1,0 +1,2 @@
+{ "mcpServers": { "db": { "command": "user-server" } },
+  "projects": { "/Users/ericgang/harness-map/test/fixtures/prec/proj": { "mcpServers": { "db": { "command": "local-server" } } } } }

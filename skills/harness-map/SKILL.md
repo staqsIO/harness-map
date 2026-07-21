@@ -51,7 +51,14 @@ reports which skills/commands/agents matched and lists `proseRefs`, the rule fil
 that describe the actual logic.
 
 If either is `ok`, read **only** the files named in its `proseRefs` and write
-`/tmp/hm-prose.json`:
+`/tmp/hm-prose.json`.
+
+**Containment is mandatory.** Read a `proseRef` only if it sits inside a scanned
+root and is a regular file, never a symlink. The scanner already excludes
+symlinked rule files for exactly this reason: a `rules/agent-routing.md` pointing
+at `~/.ssh/id_rsa` would otherwise turn a configuration map into arbitrary local
+file disclosure in a published page. Never read a path the scan did not emit, and
+never follow a path out of the config tree.
 
 ```json
 {
@@ -83,6 +90,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/audit-harness.mjs" --scan /tmp/hm-scan.json 
 
 Deterministic — do not second-guess its verdicts or add findings of your own to
 the JSON. It exits non-zero when a high-severity check fails.
+
+**Safety checks need probe evidence.** Without `--probe-hooks` on the scan, the
+`safety.blocks-*` checks are `n/a` and `safety.behaviour-verified` fails. Do not
+describe the user as protected in that state — say the guards are unverified and
+offer the probe. Only offer it; never add `--probe-hooks` on your own initiative,
+because it executes their hook commands.
 
 ## Step 4 — render and publish
 
