@@ -394,6 +394,13 @@ node "$RENDER" --scan "$TMP/r4.json" --audit "$TMP/hostile2.json" \
 check "$([ -s "$TMP/hostile2.html" ] && echo true || echo false)" \
       "renderer survives audit.findings and audit.passing as strings"
 
+# A proseRef names a file the model is told it may read, so its label must be the
+# SAME label that file carries in the rules layer. The two lists were indexed
+# independently, so `rule-03` named one file in rules.items and a different one in
+# proseRefs.
+check "$(j "$TMP/rich.json" "all(r['name'] in {x['name'] for x in d['layers']['rules']['items']} for k in ('orchestrators','review') for r in d['layers'][k].get('proseRefs',[]))")" \
+      "every proseRef label resolves to an entry in the rules layer"
+
 # The gate's defining property is about fields that do not exist yet, so it is
 # tested directly rather than through a fixture.
 GATE_OUT="$(node "$ROOT/test/gate-test.mjs" 2>&1)"

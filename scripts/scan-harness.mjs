@@ -1061,14 +1061,22 @@ function applyProsePolicy(doc, includeProse) {
       m.envKeys = (m.envKeys ?? []).map((_, i) => `env-${pad(i)}`);
     }
   }
+  // Rule labels must be assigned ONCE and reused, because proseRefs point at the
+  // same files. Indexing the two lists separately produced a `rule-03` in
+  // rules.items and a different `rule-03` in proseRefs — the same label naming two
+  // files, which is worse than an opaque label.
+  const ruleLabels = new Map();
   if (L.rules?.status === 'ok') {
     L.rules.items.forEach((r, i) => {
       r.headingCount = Array.isArray(r.headings) ? r.headings.length : 0;
       r.headings = [];
-      // Rule filenames are the routing vocabulary; keep the well-known ones only.
-      if (!/^(CLAUDE\.md|agent-routing|safety|verifier-protocol|context-hygiene|git-conventions)$/.test(r.name)) {
-        r.name = `rule-${pad(i)}`;
-      }
+      // These filenames are shared routing vocabulary rather than authored
+      // secrets, and readers navigate by them, so they are kept verbatim.
+      const label = /^(CLAUDE\.md|agent-routing|safety|verifier-protocol|context-hygiene|git-conventions)$/.test(r.name)
+        ? r.name
+        : `rule-${pad(i)}`;
+      ruleLabels.set(r.name, label);
+      r.name = label;
       r.file = '<file>';
     });
   }
@@ -1085,7 +1093,7 @@ function applyProsePolicy(doc, includeProse) {
     // A rule FILENAME is authored (CLIENT-routing-SECRET.md), so the default
     // refers to prose sources by index.
     layer.proseRefs = (layer.proseRefs ?? []).map((r, i) => ({
-      name: `rule-${pad(i)}`, file: '<file>', headings: [],
+      name: ruleLabels.get(r.name) ?? `rule-${pad(i)}`, file: '<file>', headings: [],
     }));
   }
   // A parse-warning message quotes the offending KEY, which is authored text:
